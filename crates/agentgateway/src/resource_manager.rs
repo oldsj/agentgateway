@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::pending;
@@ -133,15 +134,38 @@ impl ResourceFetcher {
 				.await
 				.map(|r| r.content),
 			ResourceFetcherMode::FilesOnly => match normalized {
-				ResourceRef::File(path) => fs_err::tokio::read(&path)
-					.await
-					.with_context(|| format!("read resource file {}", path.display()))
-					.map(Bytes::from),
+				ResourceRef::File(path) => {
+					FILES_ONLY_READS.with(|reads| {
+						if let Some(reads) = reads.borrow_mut().as_mut() {
+							reads.push(path.clone());
+						}
+					});
+					fs_err::tokio::read(&path)
+						.await
+						.with_context(|| format!("read resource file {}", path.display()))
+						.map(Bytes::from)
+				},
 				ResourceRef::Http { url, .. } => {
 					Err(anyhow!("resource fetcher cannot fetch HTTP resource {url}"))
 				},
 			},
 		}
+	}
+
+	/// Makes the files a recorded parse read ([`record_files_only_reads`]) this
+	/// fetcher's own dependencies. In managed mode each one is fetched through the
+	/// manager, which caches, watches and periodically re-reads it and, once the
+	/// surrounding full computation commits, keeps it active: a change to it
+	/// reloads the config like a change to any other file resource. The other
+	/// modes have nothing to register; the parse already holds the content.
+	pub async fn register_file_dependencies(&self, files: Vec<PathBuf>) -> anyhow::Result<()> {
+		if !matches!(self.mode, ResourceFetcherMode::Managed(_)) {
+			return Ok(());
+		}
+		for path in files.into_iter().collect::<HashSet<_>>() {
+			self.fetch(ResourceRef::File(path)).await?;
+		}
+		Ok(())
 	}
 
 	/// Records managed resource lookups during a full config computation.
@@ -184,6 +208,31 @@ impl ResourceFetcher {
 			tracking.insert(resource);
 		}
 	}
+}
+
+thread_local! {
+	/// The files a files-only fetcher read on this thread while
+	/// [`record_files_only_reads`] was running.
+	static FILES_ONLY_READS: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+}
+
+/// Runs `parse` and returns, besides its result, every file a
+/// [`ResourceFetcher::files_only`] fetcher read on this thread meanwhile.
+///
+/// Serde hooks (`de_from_local_backend_policy`) resolve backend TLS file
+/// references while the config is deserialized, with a files-only fetcher and
+/// outside any resource manager: the content is current, but the manager never
+/// learns of the file, so it gets no watch, no periodic re-read and no place in
+/// the active set, and a certificate referenced only there is re-read only when
+/// some other resource happens to trigger a reload. The parse is synchronous,
+/// so recording on the thread that runs it is exact; the caller registers the
+/// files with its managed fetcher afterwards
+/// ([`ResourceFetcher::register_file_dependencies`]).
+pub fn record_files_only_reads<T>(parse: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+	let previous = FILES_ONLY_READS.with(|reads| reads.replace(Some(Vec::new())));
+	let value = parse();
+	let reads = FILES_ONLY_READS.with(|reads| reads.replace(previous));
+	(value, reads.unwrap_or_default())
 }
 
 impl ResourceFetchScope<'_> {
@@ -541,7 +590,7 @@ impl ResourceManager {
 		fetch_direct(&self.inner.client, resource).await
 	}
 
-	fn is_active(&self, resource: &ResourceRef) -> bool {
+	pub(crate) fn is_active(&self, resource: &ResourceRef) -> bool {
 		self
 			.inner
 			.active_resources
@@ -1029,6 +1078,61 @@ mod tests {
 		assert!(
 			scheduled_retry < far_future,
 			"failed refresh should reschedule sooner than the stale next_refresh from the last success"
+		);
+	}
+
+	/// A serde hook reads backend TLS files with a files-only fetcher while the
+	/// config is parsed. Recorded around the parse and registered with the managed
+	/// fetcher, such a file becomes a dependency like any other: cached, watched,
+	/// active once the computation commits.
+	#[tokio::test]
+	async fn files_only_reads_during_a_recorded_parse_become_managed_dependencies() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("credential-bundle.pem");
+		fs_err::write(&file, "cert").unwrap();
+		let resource = normalize_resource(ResourceRef::File(file.clone())).unwrap();
+		let ResourceRef::File(abspath) = resource.clone() else {
+			unreachable!()
+		};
+
+		let ((), reads) = record_files_only_reads(|| {
+			// What `de_from_local_backend_policy` does: a files-only fetcher, blocked on.
+			let content = futures::executor::block_on(
+				ResourceFetcher::files_only().fetch(ResourceRef::File(file.clone())),
+			)
+			.unwrap();
+			assert_eq!(content, Bytes::from("cert"));
+		});
+		assert_eq!(reads, vec![abspath.clone()]);
+		// Outside a recording a files-only read leaves no trace.
+		ResourceFetcher::files_only()
+			.fetch(ResourceRef::File(file.clone()))
+			.await
+			.unwrap();
+		FILES_ONLY_READS.with(|r| assert!(r.borrow().is_none()));
+
+		// Nothing to register for a fetcher without a manager, even for a file that
+		// is gone: the parse already holds the content.
+		ResourceFetcher::direct(test_client())
+			.register_file_dependencies(vec![dir.path().join("missing.pem")])
+			.await
+			.unwrap();
+
+		let manager = ResourceManager::new(test_client()).unwrap();
+		let resources = ResourceFetcher::managed(manager.clone());
+		scoped(&resources, || async {
+			resources.register_file_dependencies(reads.clone()).await
+		})
+		.await
+		.unwrap();
+		assert_eq!(manager.cached(&resource), Some(Bytes::from("cert")));
+		assert!(
+			manager.is_active(&resource),
+			"the registered file is active"
+		);
+		assert!(
+			manager.inner.watched_files.contains(&abspath),
+			"the registered file is watched"
 		);
 	}
 }
