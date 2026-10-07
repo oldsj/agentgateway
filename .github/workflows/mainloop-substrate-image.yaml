@@ -1,0 +1,89 @@
+name: Mainloop Substrate agentgateway image
+
+# Builds the agentgateway image used by Mainloop's Substrate 0.4.0-alpha1
+# deployment: Substrate's pinned agentgateway (50999825) plus the pod
+# certificate rotation fixes from agentgateway #3686 and #3794.
+
+on:
+  push:
+    branches:
+      - mainloop-substrate-certs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.98.0"
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/agentgateway
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Library tests
+        run: cargo test -p agentgateway --lib
+      - name: Substrate integration tests
+        run: cargo test -p agentgateway --test integration substrate
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Compute image tag
+        id: version
+        run: |
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY_IMAGE }}:${{ steps.version.outputs.tag }}
+          build-args: |
+            VERSION=0.0.0-alpha.${{ steps.version.outputs.tag }}
+            GIT_REVISION=${{ steps.version.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
+          cache-from: type=gha,scope=mainloop-substrate-arm64
+          cache-to: type=gha,mode=max,scope=mainloop-substrate-arm64
+      - name: Record published digest
+        env:
+          IMAGE: ${{ env.REGISTRY_IMAGE }}:${{ steps.version.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          test -n "$DIGEST"
+          echo "Image: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
