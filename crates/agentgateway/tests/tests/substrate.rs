@@ -1,16 +1,44 @@
-use agentgateway::test_helpers::{ateapimock, credprovidermock};
-use agentgateway::transport::stream::TLSConnectionInfo;
+use std::net::SocketAddr;
+
+use agentgateway::test_helpers::{ateapimock, credprovidermock, oteltracemock};
+use agentgateway::transport::stream::{SocketType, TLSConnectionInfo};
 use agentgateway::transport::tls::TlsInfo;
 use agentgateway::types::agent::{Backend, BackendWithPolicies, BindMode, TunnelProtocol};
+use futures::FutureExt;
 use protos::ateapi::{
 	Actor, ActorState, ActorStatus, EgressPolicy, ResourceMetadata, ResumeActorResponse,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
+use tonic_types::{ErrorDetails, StatusExt};
 
 use crate::common::prelude::*;
 
 const ACTOR_UID: &str = "6f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+// Port 1 is privileged and outside the ephemeral range: nothing in the test process listens there.
+const UNREACHABLE_ADDR: &str = "127.0.0.1:1";
+
+#[test]
+fn substrate_control_api_wire_tags() {
+	// Canonical Substrate tags: Actor.status=5 and MintActorJwtRequest fields=1,2,3.
+	let actor = <Actor as prost::Message>::decode(&b"\x2a\x04\x08\x02\x12\x00"[..]).unwrap();
+	let status = actor.status.unwrap();
+	assert_eq!(status.state, ActorState::Running as i32);
+	assert!(status.worker_assignment.is_some());
+
+	let request = protos::ateapi::MintActorJwtRequest {
+		actor: Some(protos::ateapi::ObjectRef {
+			atespace: "a".into(),
+			name: "b".into(),
+		}),
+		audiences: vec!["x".into()],
+		expiration_seconds: 1,
+	};
+	assert_eq!(
+		prost::Message::encode_to_vec(&request),
+		b"\x0a\x06\x0a\x01a\x12\x01b\x12\x01x\x18\x01",
+	);
+}
 
 async fn send_request(io: MemoryClient, method: Method, url: &str) -> Response {
 	let authority = url
@@ -45,13 +73,17 @@ struct IngressHandler {
 #[derive(Clone)]
 struct EgressHandler {
 	uid: &'static str,
-	state: ActorState,
+	state: Option<i32>,
 	error: Option<tonic::Code>,
 }
 
 #[derive(Clone)]
 struct CredentialEgressHandler {
 	policy: Result<EgressPolicy, tonic::Status>,
+	state: ActorState,
+	mint_calls: Option<Arc<AtomicUsize>>,
+	mint_delay: Duration,
+	jwt_expiration_seconds: i64,
 }
 
 #[async_trait::async_trait]
@@ -71,7 +103,7 @@ impl ateapimock::Handler for CredentialEgressHandler {
 				..Default::default()
 			}),
 			status: Some(ActorStatus {
-				state: ActorState::Running as i32,
+				state: self.state as i32,
 				worker_assignment: None,
 			}),
 		})
@@ -81,12 +113,37 @@ impl ateapimock::Handler for CredentialEgressHandler {
 		&mut self,
 		request: &protos::ateapi::GetActorEgressPolicyRequest,
 	) -> Result<EgressPolicy, tonic::Status> {
+		if request.name != "default" {
+			return Err(tonic::Status::invalid_argument("name must be default"));
+		}
 		let actor = request.actor.as_ref().unwrap();
 		assert_eq!(
 			(actor.atespace.as_str(), actor.name.as_str()),
 			("demo", "my-actor")
 		);
 		self.policy.clone()
+	}
+
+	async fn mint_actor_jwt(
+		&mut self,
+		request: &protos::ateapi::MintActorJwtRequest,
+	) -> Result<protos::ateapi::MintActorJwtResponse, tonic::Status> {
+		let actor = request.actor.as_ref().unwrap();
+		assert_eq!(
+			(actor.atespace.as_str(), actor.name.as_str()),
+			("demo", "my-actor")
+		);
+		assert_eq!(request.audiences, ["https://api.example.com"]);
+		assert_eq!(request.expiration_seconds, self.jwt_expiration_seconds);
+		self
+			.mint_calls
+			.as_ref()
+			.unwrap()
+			.fetch_add(1, Ordering::Relaxed);
+		tokio::time::sleep(self.mint_delay).await;
+		Ok(protos::ateapi::MintActorJwtResponse {
+			actor_jwt: "minted-actor-jwt".to_owned(),
+		})
 	}
 }
 
@@ -135,8 +192,8 @@ impl ateapimock::Handler for EgressHandler {
 				uid: self.uid.to_owned(),
 				..Default::default()
 			}),
-			status: Some(ActorStatus {
-				state: self.state as i32,
+			status: self.state.map(|state| ActorStatus {
+				state,
 				worker_assignment: None,
 			}),
 		})
@@ -162,7 +219,7 @@ impl ateapimock::Handler for IngressHandler {
 				status: Some(ActorStatus {
 					state: 0,
 					worker_assignment: Some(protos::ateapi::WorkerAssignment {
-						worker_pod_ip: self.pod_ip.clone(),
+						worker_pod_ips: vec![self.pod_ip.clone()],
 					}),
 				}),
 			}),
@@ -179,6 +236,23 @@ struct ParkingHandler {
 	failure_code: tonic::Code,
 	entered: Option<Arc<Notify>>,
 	resumed: bool,
+}
+
+#[derive(Clone)]
+struct RejectedResumeHandler {
+	status: tonic::Status,
+	calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ateapimock::Handler for RejectedResumeHandler {
+	async fn resume_actor(
+		&mut self,
+		_request: &protos::ateapi::ResumeActorRequest,
+	) -> Result<ResumeActorResponse, tonic::Status> {
+		self.calls.fetch_add(1, Ordering::Relaxed);
+		Err(self.status.clone())
+	}
 }
 
 #[derive(Clone)]
@@ -213,7 +287,7 @@ impl ateapimock::Handler for SelectiveParkingHandler {
 				status: Some(ActorStatus {
 					state: 0,
 					worker_assignment: Some(protos::ateapi::WorkerAssignment {
-						worker_pod_ip: self.pod_ip.clone(),
+						worker_pod_ips: vec![self.pod_ip.clone()],
 					}),
 				}),
 			}),
@@ -246,7 +320,7 @@ impl ateapimock::Handler for ParkingHandler {
 				status: Some(ActorStatus {
 					state: 0,
 					worker_assignment: Some(protos::ateapi::WorkerAssignment {
-						worker_pod_ip: self.pod_ip.clone(),
+						worker_pod_ips: vec![self.pod_ip.clone()],
 					}),
 				}),
 				..Default::default()
@@ -301,6 +375,141 @@ async fn actor_ingress_resolves_the_dynamic_backend() {
 		actor_requests[0].headers.get("x-ate-target-port").unwrap(),
 		"80"
 	);
+}
+
+struct TraceparentHandler(IngressHandler, Arc<StdMutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl ateapimock::Handler for TraceparentHandler {
+	async fn resume_actor(
+		&mut self,
+		request: &protos::ateapi::ResumeActorRequest,
+	) -> Result<ResumeActorResponse, tonic::Status> {
+		self.0.resume_actor(request).await
+	}
+
+	fn resume_actor_metadata(&mut self, metadata: &tonic::metadata::MetadataMap) {
+		let tp = metadata.get("traceparent").and_then(|v| v.to_str().ok());
+		self.1.lock().unwrap().extend(tp.map(str::to_owned));
+	}
+}
+
+struct TraceHandler {
+	spans: Arc<StdMutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>,
+}
+
+#[async_trait::async_trait]
+impl oteltracemock::Handler for TraceHandler {
+	async fn export(
+		&mut self,
+		request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+	) -> Result<
+		opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+		tonic::Status,
+	> {
+		self.spans.lock().unwrap().extend(
+			request
+				.resource_spans
+				.iter()
+				.flat_map(|resource| &resource.scope_spans)
+				.flat_map(|scope| &scope.spans)
+				.cloned(),
+		);
+		oteltracemock::ok_response()
+	}
+}
+
+#[tokio::test]
+async fn actor_ingress_propagates_trace_context_to_resume_actor() {
+	unsafe {
+		std::env::set_var("OTEL_BLRP_SCHEDULE_DELAY", "20");
+		std::env::set_var("OTEL_BSP_SCHEDULE_DELAY", "20");
+	}
+	let spans = Arc::new(StdMutex::new(Vec::new()));
+	let otel = oteltracemock::OtelTraceMock::new({
+		let spans = Arc::clone(&spans);
+		move || TraceHandler {
+			spans: Arc::clone(&spans),
+		}
+	})
+	.spawn()
+	.await;
+	let actor = simple_mock().await;
+	let seen = Arc::new(StdMutex::new(Vec::new()));
+	let api = ateapimock::AteApiMock::new({
+		let (seen, pod_ip) = (seen.clone(), actor.address().ip().to_string());
+		move || {
+			let inner = IngressHandler {
+				pod_ip: pod_ip.clone(),
+				calls: Default::default(),
+				resumed: true,
+				uid: ACTOR_UID,
+			};
+			TraceparentHandler(inner, seen.clone())
+		}
+	})
+	.spawn()
+	.await;
+
+	let dynamic = Backend::Dynamic(ResourceName::new("dynamic".into(), "".into()), None);
+	let mut gateway = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(dynamic.into())
+		.with_bind(simple_bind())
+		.with_route(basic_named_route(strng::literal!("/dynamic")));
+	gateway
+		.attach_frontend_policy(json!({"tracing": {"host": otel.address.to_string()}}))
+		.await;
+	gateway
+		.attach_route_policy(json!({
+			"substrateIngress": {
+				"host": api.address.to_string(),
+				"connectTargetPort": actor.address().port(),
+			}
+		}))
+		.await;
+
+	let client_tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+	let response = send_request_headers(
+		gateway.serve_http(BIND_KEY),
+		Method::GET,
+		"http://my-actor.demo.actors.resources.substrate.ate.dev/",
+		&[
+			("ate-target-actor", "demo/my-actor"),
+			("traceparent", client_tp),
+		],
+	)
+	.await;
+	assert_eq!(response.status(), StatusCode::OK);
+
+	// Same trace and sampled flag, but the gateway's own span as parent.
+	let seen = seen.lock().unwrap().clone();
+	assert_eq!(seen.len(), 1, "{seen:?}");
+	assert_eq!(seen[0][..36], client_tp[..36]);
+	assert_ne!(seen[0][36..52], client_tp[36..52]);
+	assert!(seen[0].ends_with("-01"), "{}", seen[0]);
+
+	tokio::time::timeout(Duration::from_secs(2), async {
+		while spans.lock().unwrap().len() < 2 {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+
+	let spans = spans.lock().unwrap();
+	let resume_actor = spans
+		.iter()
+		.find(|span| span.name == "substrate.ateapi.v1.Control/ResumeActor")
+		.expect("ResumeActor client span should be exported");
+	let request = spans
+		.iter()
+		.find(|span| {
+			span.trace_id == resume_actor.trace_id && span.span_id == resume_actor.parent_span_id
+		})
+		.expect("parent request span should be exported");
+	assert_eq!(resume_actor.trace_id, request.trace_id);
+	assert_eq!(resume_actor.parent_span_id, request.span_id);
 }
 
 #[tokio::test]
@@ -533,6 +742,97 @@ async fn resume_disposition_gateway(
 		}))
 		.await;
 	gateway
+}
+
+async fn actor_service_ingress_response(
+	api_address: SocketAddr,
+	request_parking: Value,
+) -> Response {
+	let dynamic = Backend::Dynamic(ResourceName::new("dynamic".into(), "".into()), None);
+	let mut gateway = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(dynamic.into())
+		.with_bind(simple_bind())
+		.with_route(basic_named_route(strng::literal!("/dynamic")));
+	gateway
+		.attach_route_policy(json!({
+			"substrateIngress": {
+				"host": api_address.to_string(),
+				"connectTargetPort": 80,
+				"requestParking": request_parking,
+			}
+		}))
+		.await;
+	send_request(
+		gateway.serve_http(BIND_KEY),
+		Method::GET,
+		&actor_url("my-actor", "/"),
+	)
+	.await
+}
+
+#[tokio::test]
+async fn actor_ingress_rejections_match_substrate_contract() {
+	let response =
+		actor_service_ingress_response(UNREACHABLE_ADDR.parse().unwrap(), json!({ "max": 0 })).await;
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(response.headers()["ate-error-reason"], "API_UNAVAILABLE");
+
+	let api = ateapimock::AteApiMock::new(|| RejectedResumeHandler {
+		status: tonic::Status::unavailable("resume unavailable"),
+		calls: Default::default(),
+	})
+	.spawn()
+	.await;
+	let response = actor_service_ingress_response(
+		api.address,
+		json!({
+			"budget": "100ms",
+			"max": 1,
+			"retryInterval": "10ms",
+			"retryFactor": 1.0,
+		}),
+	)
+	.await;
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(response.headers()["ate-error-reason"], "API_UNAVAILABLE");
+
+	for (code, reason) in [
+		(tonic::Code::ResourceExhausted, "NO_CAPACITY"),
+		(tonic::Code::FailedPrecondition, "TERMINAL_STATE"),
+	] {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let status = tonic::Status::with_error_details(
+			code,
+			"resume refused",
+			ErrorDetails::with_error_info(reason, "ate.dev", std::collections::HashMap::new()),
+		);
+		let api = ateapimock::AteApiMock::new({
+			let calls = calls.clone();
+			move || RejectedResumeHandler {
+				status: status.clone(),
+				calls: calls.clone(),
+			}
+		})
+		.spawn()
+		.await;
+		let request_parking = if reason == "NO_CAPACITY" {
+			json!({ "max": 0 })
+		} else {
+			json!({
+				"budget": "100ms",
+				"max": 1,
+				"retryInterval": "10ms",
+				"retryFactor": 1.0,
+			})
+		};
+		let response = actor_service_ingress_response(api.address, request_parking).await;
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		assert_eq!(response.headers()["ate-error-reason"], reason);
+		if reason == "TERMINAL_STATE" {
+			assert_eq!(calls.load(Ordering::Relaxed), 1);
+		}
+	}
 }
 
 #[tokio::test]
@@ -1092,8 +1392,11 @@ async fn actor_ingress_reports_no_resume_when_the_resume_fails() {
 	assert_eq!(resumes, vec!["none"], "{events:#?}");
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
 #[tokio::test]
-async fn actor_ingress_uses_the_original_connect_target_actor() {
+async fn actor_ingress_uses_the_original_connect_target_actor(#[case] http2: bool) {
 	let actor = simple_mock().await;
 	let calls = Arc::new(AtomicUsize::new(0));
 	let api = ateapimock::AteApiMock::new({
@@ -1132,31 +1435,56 @@ async fn actor_ingress_uses_the_original_connect_target_actor() {
 		}))
 		.await;
 
-	let mut io = gateway.serve_tunnel(strng::literal!("outer"));
+	let mut io = SocketType::Memory(gateway.serve_tunnel(strng::literal!("outer")));
 	let connect_target = "application.example:9090";
-	io.write_all(
+	let mut connection = None;
+	if http2 {
+		let (mut sender, driver) =
+			hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+				.handshake(hyper_util::rt::TokioIo::new(io))
+				.await
+				.unwrap();
+		connection = Some(tokio::spawn(driver));
+		let mut response = sender
+			.send_request(
+				::http::Request::builder()
+					.method(Method::CONNECT)
+					.uri(connect_target)
+					.header("ate-target-actor", "demo/my-actor")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		io = SocketType::Upgraded(hyper_util::rt::TokioIo::new(
+			hyper::upgrade::on(&mut response).await.unwrap(),
+		));
+	} else {
+		io.write_all(
 	format!(
-		"CONNECT {connect_target} HTTP/1.1\r\nHost: {connect_target}\r\nate-target-actor: demo/my-actor\r\n\r\n"
+		"CONNECT {connect_target} HTTP/1.1\r\nHost: unrelated.example:8080\r\nate-target-actor: demo/my-actor\r\n\r\n"
 	)
 	.as_bytes(),
 	)
 	.await
 	.unwrap();
-	let mut response = Vec::new();
-	loop {
-		let mut chunk = [0; 1024];
-		let n = io.read(&mut chunk).await.unwrap();
-		assert!(n > 0, "CONNECT response unexpectedly closed");
-		response.extend_from_slice(&chunk[..n]);
-		if response.windows(4).any(|window| window == b"\r\n\r\n") {
-			break;
+		let mut response = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+			if response.windows(4).any(|window| window == b"\r\n\r\n") {
+				break;
+			}
 		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
 	}
-	assert!(
-		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
-		"unexpected CONNECT response: {}",
-		String::from_utf8_lossy(&response),
-	);
 
 	// The re-entered request's Host is unrelated to the actor. Native ingress
 	// must use the original CONNECT routing header retained in SourceContext.
@@ -1179,6 +1507,9 @@ async fn actor_ingress_uses_the_original_connect_target_actor() {
 		actor_requests[0].headers.get("x-ate-target-port").unwrap(),
 		"9090"
 	);
+	if let Some(connection) = connection {
+		connection.abort();
+	}
 }
 
 #[tokio::test]
@@ -1310,10 +1641,18 @@ async fn substrate_egress_connect_status(
 	certificate_uri: &str,
 	payload: &[u8],
 ) -> StatusCode {
-	let upstream = simple_mock().await;
 	let api = ateapimock::AteApiMock::new(move || handler.clone())
 		.spawn()
 		.await;
+	substrate_egress_connect_status_at(api.address, certificate_uri, payload).await
+}
+
+async fn substrate_egress_connect_status_at(
+	api_address: std::net::SocketAddr,
+	certificate_uri: &str,
+	payload: &[u8],
+) -> StatusCode {
+	let upstream = simple_mock().await;
 
 	let mut outer = simple_bind();
 	outer.key = strng::literal!("outer");
@@ -1331,7 +1670,7 @@ async fn substrate_egress_connect_status(
 	gateway
 		.attach_frontend_policy(json!({
 			"substrateEgressActorResolution": {
-				"host": api.address.to_string(),
+				"host": api_address.to_string(),
 			}
 		}))
 		.await;
@@ -1372,19 +1711,172 @@ async fn substrate_egress_connect_status(
 	}
 }
 
-async fn open_actor_egress_tunnel(gateway: &TestBind, port: u16) -> tokio::io::DuplexStream {
-	let mut io = gateway.serve_tunnel_with_tls_info(
+#[tokio::test]
+async fn substrate_egress_actor_resolution_refreshes_on_long_lived_tunnel() {
+	#[derive(Clone)]
+	struct CountingHandler {
+		calls: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl ateapimock::Handler for CountingHandler {
+		async fn get_actor(
+			&mut self,
+			_request: &protos::ateapi::GetActorRequest,
+		) -> Result<Actor, tonic::Status> {
+			self.calls.fetch_add(1, Ordering::Relaxed);
+			Ok(Actor {
+				metadata: Some(ResourceMetadata {
+					uid: "uid-1".to_owned(),
+					..Default::default()
+				}),
+				status: Some(ActorStatus {
+					state: ActorState::Running as i32,
+					worker_assignment: None,
+				}),
+			})
+		}
+	}
+
+	let first_calls = Arc::new(AtomicUsize::new(0));
+	let first_api = ateapimock::AteApiMock::new({
+		let calls = first_calls.clone();
+		move || CountingHandler {
+			calls: calls.clone(),
+		}
+	})
+	.spawn()
+	.await;
+	let second_calls = Arc::new(AtomicUsize::new(0));
+	let second_api = ateapimock::AteApiMock::new({
+		let calls = second_calls.clone();
+		move || CountingHandler {
+			calls: calls.clone(),
+		}
+	})
+	.spawn()
+	.await;
+
+	let mut outer = simple_bind();
+	outer.key = strng::literal!("outer");
+	outer.address = "127.0.0.1:15012".parse().unwrap();
+	let mut inner = simple_bind();
+	inner.address = "0.0.0.0:18080".parse().unwrap();
+	inner.mode = BindMode::Internal;
+	let mut gateway = setup_proxy_test("{}")
+		.unwrap()
+		.with_bind(outer)
+		.with_bind(inner)
+		.with_connect_mode_on_port(agentgateway::types::frontend::ConnectMode::Tunnel, 15012);
+	gateway
+		.attach_frontend_policy(json!({
+			"substrateEgressActorResolution": {
+				"host": first_api.address.to_string(),
+			}
+		}))
+		.await;
+
+	let io = gateway.serve_tunnel_with_tls_info(
 		strng::literal!("outer"),
 		Some(TLSConnectionInfo {
 			src_identity: Some(TlsInfo {
 				certificate: Some(
-					actor_certificate("spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor").into(),
+					actor_certificate("spiffe://substrate-actor.local/worker-for-actor/demo/my-actor").into(),
 				),
 				..Default::default()
 			}),
 			..Default::default()
 		}),
 	);
+	let (mut sender, connection) =
+		hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+			.handshake(hyper_util::rt::TokioIo::new(io))
+			.await
+			.unwrap();
+	let connection = tokio::spawn(connection);
+
+	let connect = || {
+		::http::Request::builder()
+			.method(Method::CONNECT)
+			.uri("allowed.example:18080")
+			.body(Body::empty())
+			.unwrap()
+	};
+	assert_eq!(
+		sender.send_request(connect()).await.unwrap().status(),
+		StatusCode::OK
+	);
+	assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+
+	gateway
+		.pi
+		.stores
+		.binds
+		.write()
+		.remove_policy(strng::literal!("pol/1"));
+	gateway
+		.attach_frontend_policy(json!({
+			"substrateEgressActorResolution": {
+				"host": second_api.address.to_string(),
+			}
+		}))
+		.await;
+
+	assert_eq!(
+		sender.send_request(connect()).await.unwrap().status(),
+		StatusCode::OK
+	);
+	assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+	assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+	connection.abort();
+}
+
+async fn open_actor_egress_tunnel(gateway: &TestBind, port: u16) -> tokio::io::DuplexStream {
+	match open_actor_egress_tunnel_protocol(gateway, port, false).await {
+		tokio_util::either::Either::Left(io) => io,
+		tokio_util::either::Either::Right(_) => unreachable!(),
+	}
+}
+
+async fn open_actor_egress_tunnel_protocol(
+	gateway: &TestBind,
+	port: u16,
+	http2: bool,
+) -> tokio_util::either::Either<tokio::io::DuplexStream, TokioIo<hyper::upgrade::Upgraded>> {
+	let mut io = gateway.serve_tunnel_with_tls_info(
+		strng::literal!("outer"),
+		Some(TLSConnectionInfo {
+			src_identity: Some(TlsInfo {
+				certificate: Some(
+					actor_certificate("spiffe://substrate-actor.local/worker-for-actor/demo/my-actor").into(),
+				),
+				..Default::default()
+			}),
+			..Default::default()
+		}),
+	);
+	if http2 {
+		let (mut sender, connection) =
+			hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+				.handshake(TokioIo::new(io))
+				.await
+				.unwrap();
+		tokio::spawn(connection);
+		let mut response = sender
+			.send_request(
+				::http::Request::builder()
+					.method(Method::CONNECT)
+					.uri(format!("127.0.0.2:{port}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		return tokio_util::either::Either::Right(TokioIo::new(
+			hyper::upgrade::on(&mut response).await.unwrap(),
+		));
+	}
 	io.write_all(
 		format!("CONNECT 127.0.0.2:{port} HTTP/1.1\r\nHost: 127.0.0.2:{port}\r\n\r\n").as_bytes(),
 	)
@@ -1398,20 +1890,28 @@ async fn open_actor_egress_tunnel(gateway: &TestBind, port: u16) -> tokio::io::D
 		response.extend_from_slice(&buf[..n]);
 	}
 	assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"));
-	io
+	tokio_util::either::Either::Left(io)
 }
 
 #[cfg(feature = "crypto-aws-lc")]
 #[rstest::rstest]
-#[case(false, false)]
-#[case(false, true)]
-#[case(true, false)]
-#[case(true, true)]
+#[case(false, false, false, None)]
+#[case(false, true, false, None)]
+#[case(false, true, false, Some("0s"))]
+#[case(true, false, false, None)]
+#[case(true, true, false, None)]
+#[case(false, true, true, None)]
 #[tokio::test]
 async fn substrate_egress_replaces_only_requested_credentials(
 	#[case] https: bool,
 	#[case] placeholder: bool,
+	#[case] actor_jwt: bool,
+	#[case] cache_ttl: Option<&str>,
+	#[values(ActorState::Running, ActorState::Resuming)] state: ActorState,
+	#[values(false, true)] outer_http2: bool,
 ) {
+	let delayed_actor_jwt = actor_jwt && state == ActorState::Running;
+	let jwt_expiration_seconds = if delayed_actor_jwt { 3 } else { 600 };
 	let (upstream, backend_tls) = if https {
 		let (upstream, certs) = tls_mock().await;
 		let tls: agentgateway::http::backendtls::BackendTLS =
@@ -1431,7 +1931,15 @@ async fn substrate_egress_replaces_only_requested_credentials(
 		replace_headers: vec![protos::ateapi::CredentialHeader {
 			header: "authorization".to_owned(),
 			prefix: "Bearer ".to_owned(),
-			credential_uri: "ate-secret://kubernetes.io/default/upstream-token".to_owned(),
+			credential_uri: if actor_jwt {
+				String::new()
+			} else {
+				"ate-secret://kubernetes.io/default/upstream-token".to_owned()
+			},
+			actor_jwt: actor_jwt.then_some(protos::ateapi::ActorJwtSource {
+				audiences: vec!["https://api.example.com".to_owned()],
+				expiration_seconds: jwt_expiration_seconds,
+			}),
 		}],
 	});
 	let ports = Some(protos::ateapi::Ports {
@@ -1482,8 +1990,20 @@ async fn substrate_egress_replaces_only_requested_credentials(
 		rules: vec![fallback, rule],
 		..Default::default()
 	};
-	let api = ateapimock::AteApiMock::new(move || CredentialEgressHandler {
-		policy: Ok(policy.clone()),
+	let mint_calls = Arc::new(AtomicUsize::new(0));
+	let api = ateapimock::AteApiMock::new({
+		let mint_calls = mint_calls.clone();
+		move || CredentialEgressHandler {
+			policy: Ok(policy.clone()),
+			state,
+			mint_calls: actor_jwt.then(|| mint_calls.clone()),
+			mint_delay: if delayed_actor_jwt {
+				Duration::from_millis(1500)
+			} else {
+				Duration::ZERO
+			},
+			jwt_expiration_seconds,
+		}
 	})
 	.spawn()
 	.await;
@@ -1521,6 +2041,7 @@ async fn substrate_egress_replaces_only_requested_credentials(
 			} else {
 				ListenerProtocol::HTTP
 			},
+			..Default::default()
 		}]),
 	);
 	let mut gateway = crate::tests::dfp::setup_dfp_bind()
@@ -1541,24 +2062,33 @@ async fn substrate_egress_replaces_only_requested_credentials(
 		.with_connect_mode_on_port(agentgateway::types::frontend::ConnectMode::Tunnel, 15013);
 	gateway
 		.attach_frontend_policy(json!({
-			"substrateEgressActorResolution": { "host": api.address.to_string() }
+			"substrateEgressActorResolution": { "host": api.address.to_string() },
+			"accessLog": {
+				"add": {
+					"substrate.connect.authority": "destination.address + \":\" + string(destination.port)"
+				}
+			}
 		}))
 		.await;
+	let mut credential_provider_config = json!({
+		"uriAuthority": "kubernetes.io",
+		"target": { "host": credential_provider.address.to_string() }
+	});
+	if let Some(ttl) = cache_ttl {
+		credential_provider_config["cacheTtl"] = json!(ttl);
+	}
 	gateway
 		.attach_route_policy(json!({
 			"substrateEgress": {
 				"host": api.address.to_string(),
-				"credentialProviders": [{
-					"uriAuthority": "kubernetes.io",
-					"target": { "host": credential_provider.address.to_string() }
-				}]
+				"credentialProviders": [credential_provider_config]
 			}
 		}))
 		.await;
 
-	let io = open_actor_egress_tunnel(&gateway, port).await;
+	let io = open_actor_egress_tunnel_protocol(&gateway, port, outer_http2).await;
 
-	let path = format!("/substrate-egress-credentials-{https}-{placeholder}");
+	let path = format!("/substrate-egress-credentials-{https}-{placeholder}-{port}-{outer_http2}");
 	let authorization = if placeholder {
 		"AuThOrIzAtIoN: Bearer actor-supplied\r\n"
 	} else {
@@ -1607,32 +2137,73 @@ async fn substrate_egress_replaces_only_requested_credentials(
 
 	assert_eq!(
 		credential_calls.load(Ordering::Relaxed),
-		usize::from(placeholder)
+		usize::from(placeholder && !actor_jwt)
 	);
+	assert_eq!(
+		mint_calls.load(Ordering::Relaxed),
+		usize::from(placeholder && actor_jwt)
+	);
+	if delayed_actor_jwt {
+		tokio::time::sleep(Duration::from_millis(700)).await;
+		let io = open_actor_egress_tunnel_protocol(&gateway, port, outer_http2).await;
+		exchange(io, &request).await;
+		assert_eq!(mint_calls.load(Ordering::Relaxed), 2);
+	}
+	// A second request reuses the cached credential unless the provider's TTL is zero.
+	let repeated = placeholder && !actor_jwt && !https;
+	if repeated {
+		let io = open_actor_egress_tunnel_protocol(&gateway, port, outer_http2).await;
+		exchange(io, &request).await;
+		assert_eq!(
+			credential_calls.load(Ordering::Relaxed),
+			1 + usize::from(cache_ttl == Some("0s"))
+		);
+	}
 	let upstream_requests = upstream.received_requests().await.unwrap();
-	assert_eq!(upstream_requests.len(), 1);
+	assert_eq!(
+		upstream_requests.len(),
+		if delayed_actor_jwt || repeated { 2 } else { 1 }
+	);
 	assert_eq!(
 		upstream_requests[0]
 			.headers
 			.get("authorization")
 			.map(|v| v.to_str().unwrap()),
-		placeholder.then_some("Bearer injected-token")
+		placeholder.then_some(if actor_jwt {
+			"Bearer minted-actor-jwt"
+		} else {
+			"Bearer injected-token"
+		})
 	);
+	if actor_jwt {
+		return;
+	}
 	let log = find_request_log(&path).await;
 	assert_eq!(log["ate.actor.uid"].as_str(), Some("uid-1"), "{log:#?}");
 	assert_eq!(log["ate.actor.name"].as_str(), Some("my-actor"), "{log:#?}");
 	assert_eq!(log["ate.atespace"].as_str(), Some("demo"), "{log:#?}");
+	assert_eq!(
+		log["substrate.connect.authority"].as_str(),
+		Some(format!("127.0.0.2:{port}").as_str()),
+		"{log:#?}"
+	);
+	assert_eq!(log["http.status"].as_u64(), Some(200), "{log:#?}");
 }
 
 // Provide both TLS paths for the same name. The policy must choose between them,
 // even when the HTTPS listener is a more specific static listener match.
 async fn substrate_tls_gateway(
 	policy: Result<EgressPolicy, tonic::Status>,
+	state: ActorState,
 	upstream: std::net::SocketAddr,
 	root: Option<Vec<u8>>,
 ) -> (TestBind, agentgateway::test_helpers::MockInstance) {
 	let api = ateapimock::AteApiMock::new(move || CredentialEgressHandler {
 		policy: policy.clone(),
+		state,
+		mint_calls: None,
+		mint_delay: Duration::ZERO,
+		jwt_expiration_seconds: 600,
 	})
 	.spawn()
 	.await;
@@ -1656,18 +2227,21 @@ async fn substrate_tls_gateway(
 				name: Default::default(),
 				hostname: "localhost".into(),
 				protocol: ListenerProtocol::HTTPS(crate::tests::tls::test_server_tls_config()),
+				..Default::default()
 			},
 			Listener {
 				key: tls_listener.clone(),
 				name: Default::default(),
 				hostname: Default::default(),
 				protocol: ListenerProtocol::TLS(None),
+				..Default::default()
 			},
 			Listener {
 				key: tcp_listener.clone(),
 				name: Default::default(),
 				hostname: Default::default(),
 				protocol: ListenerProtocol::TCP,
+				..Default::default()
 			},
 		]),
 	);
@@ -1728,6 +2302,7 @@ async fn substrate_egress_selects_tls_from_policy_and_rechecks_http(
 	#[case] intercept: bool,
 	#[case] allowed_request: bool,
 	#[case] use_connect_ip: bool,
+	#[values(ActorState::Running, ActorState::Resuming)] state: ActorState,
 ) {
 	let (upstream, certs) = tls_mock().await;
 	let port = upstream.address().port();
@@ -1763,6 +2338,7 @@ async fn substrate_egress_selects_tls_from_policy_and_rechecks_http(
 	};
 	let (gateway, _api) = substrate_tls_gateway(
 		Ok(policy),
+		state,
 		*upstream.address(),
 		Some(certs.root_cert.pem().into_bytes()),
 	)
@@ -1843,14 +2419,29 @@ async fn substrate_egress_selects_tls_from_policy_and_rechecks_http(
 
 #[cfg(feature = "crypto-aws-lc")]
 #[rstest::rstest]
-#[case("unmatched-sni")]
-#[case("unmatched-sni-allowed-authority")]
-#[case("unmatched-port")]
-#[case("empty-policy")]
-#[case("http-rule")]
+#[case(false, "websocket")]
+#[case(true, "websocket")]
+#[case(false, "WebSocket")]
+#[case(true, "WebSocket")]
+#[case(false, "h2c\r\nUpgrade: websocket")]
+#[case(true, "h2c\r\nUpgrade: websocket")]
+#[case(false, "CONNECT")]
+#[case(true, "CONNECT")]
+#[case(false, "custom-protocol")]
+#[case(true, "custom-protocol")]
 #[tokio::test]
-async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind: &str) {
-	let (upstream, certs) = tls_mock().await;
+async fn substrate_egress_denies_http_upgrades_without_dialing(
+	#[case] https: bool,
+	#[case] upgrade: &str,
+	#[values(false, true)] rejection_route: bool,
+	#[values(false, true)] policy_allowed: bool,
+) {
+	let (upstream, root) = if https {
+		let (upstream, certs) = tls_mock().await;
+		(upstream, Some(certs.root_cert.pem().into_bytes()))
+	} else {
+		(simple_mock().await, None)
+	};
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let address = listener.local_addr().unwrap();
 	let port = address.port();
@@ -1866,8 +2457,228 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 			});
 		}
 	});
+	let ports = Some(protos::ateapi::Ports {
+		numbers: vec![i32::from(port)],
+		..Default::default()
+	});
+	let rule = if https {
+		protos::ateapi::EgressRule {
+			https: Some(protos::ateapi::HttpsRule {
+				hostnames: vec!["localhost".to_owned()],
+				ports,
+				effects: None,
+			}),
+			..Default::default()
+		}
+	} else {
+		protos::ateapi::EgressRule {
+			http: Some(protos::ateapi::HttpRule {
+				hostnames: vec!["localhost".to_owned()],
+				ports,
+				effects: None,
+			}),
+			..Default::default()
+		}
+	};
+	let (mut gateway, _api) = substrate_tls_gateway(
+		Ok(EgressPolicy {
+			rules: if policy_allowed { vec![rule] } else { vec![] },
+			..Default::default()
+		}),
+		ActorState::Running,
+		address,
+		root,
+	)
+	.await;
+	if rejection_route {
+		gateway
+			.attach_route(json!({
+				"name": "reject-upgrades",
+				"matches": if upgrade == "CONNECT" { json!([{ "method": "CONNECT" }]) } else { json!([{
+					"path": { "exact": format!("/upgrade-{port}-true") },
+					"headers": [{ "name": "upgrade", "value": { "regex": ".+" } }]
+				}]) },
+				"policies": {
+					"directResponse": {
+						"status": 403,
+						"body": "WebSocket egress is not supported"
+					}
+				}
+			}))
+			.await;
+	}
+	let gateway = if https {
+		gateway
+	} else {
+		let mut inner = simple_bind();
+		inner.address = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+		inner.mode = BindMode::Internal;
+		inner.protocol = BindProtocol::auto;
+		gateway.with_bind(inner)
+	};
 
-	// The same destination must work when allowed, then return an HTTP denial
+	async fn exchange(mut io: impl AsyncRead + AsyncWrite + Unpin, request: &str) -> Vec<u8> {
+		io.write_all(request.as_bytes()).await.unwrap();
+		let mut response = Vec::new();
+		while !response.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+			let mut buf = [0; 256];
+			let n = io.read(&mut buf).await.unwrap();
+			assert_ne!(n, 0, "connection closed before HTTP response headers");
+			response.extend_from_slice(&buf[..n]);
+		}
+		let headers_end = response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+		let content_length = std::str::from_utf8(&response[..headers_end])
+			.unwrap()
+			.lines()
+			.filter_map(|line| line.split_once(':'))
+			.find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+			.map(|(_, value)| value.trim().parse::<usize>().unwrap())
+			.expect("response has a content length");
+		let received = response.len();
+		response.resize(headers_end + content_length, 0);
+		io.read_exact(&mut response[received..]).await.unwrap();
+		response
+	}
+
+	for upgrading in [false, true] {
+		let path = format!("/upgrade-{port}-{upgrading}");
+		let connect_host = format!("connect-{port}.example");
+		let io = open_actor_egress_tunnel(&gateway, port).await;
+		let headers = if upgrading {
+			format!(
+				"Connection: close, UpGrAdE\r\nUpGrAdE: {upgrade}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+			)
+		} else {
+			"Connection: close\r\n".to_owned()
+		};
+		let request = if upgrading && upgrade == "CONNECT" {
+			format!(
+				"CONNECT {connect_host}:443 HTTP/1.1\r\nHost: {connect_host}:443\r\nConnection: close\r\n\r\n"
+			)
+		} else {
+			format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n")
+		};
+		let response = tokio::time::timeout(Duration::from_secs(3), async {
+			if https {
+				let tls: agentgateway::http::backendtls::BackendTLS =
+					agentgateway::http::backendtls::ResolvedBackendTLS {
+						root: Some(include_bytes!("../../../../examples/mcp-tls/certs/ca-cert.pem").to_vec()),
+						alpn: Some(vec!["http/1.1".to_owned()]),
+						..Default::default()
+					}
+					.try_into()
+					.unwrap();
+				let handshake = tokio_rustls::TlsConnector::from(tls.base_config().config)
+					.connect(
+						rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+						io,
+					)
+					.await;
+				if !policy_allowed {
+					assert!(handshake.is_err(), "denied TLS handshake completed");
+					return Vec::new();
+				}
+				let io = handshake.unwrap();
+				exchange(io, &request).await
+			} else {
+				exchange(io, &request).await
+			}
+		})
+		.await
+		.expect("timed out waiting for HTTP response");
+		if https && !policy_allowed {
+			assert!(response.is_empty());
+			assert!(
+				tokio::time::timeout(Duration::from_millis(50), connections.recv())
+					.await
+					.is_err(),
+				"denied TLS opened an upstream connection"
+			);
+			assert!(upstream.received_requests().await.unwrap().is_empty());
+			continue;
+		}
+		let expected = if upgrading || !policy_allowed {
+			"HTTP/1.1 403 Forbidden\r\n"
+		} else {
+			"HTTP/1.1 200 OK\r\n"
+		};
+		assert!(
+			response.starts_with(expected.as_bytes()),
+			"{}",
+			String::from_utf8_lossy(&response)
+		);
+		if upgrading || !policy_allowed {
+			let body = response
+				.split_at(response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4)
+				.1;
+			let expected = if !upgrading {
+				"actor egress policy denied"
+			} else if upgrade == "CONNECT" {
+				"CONNECT egress is not supported"
+			} else if upgrade.to_ascii_lowercase().contains("websocket") {
+				"WebSocket egress is not supported"
+			} else {
+				"HTTP upgrades, including CONNECT, are denied for actor egress"
+			};
+			assert_eq!(body, expected.as_bytes());
+		}
+		if upgrading || !policy_allowed {
+			assert!(
+				tokio::time::timeout(Duration::from_millis(50), connections.recv())
+					.await
+					.is_err(),
+				"denied upgrade opened an upstream connection"
+			);
+		} else {
+			connections.recv().await.unwrap();
+		}
+		assert_eq!(
+			upstream.received_requests().await.unwrap().len(),
+			usize::from(policy_allowed)
+		);
+	}
+	forwarder.abort();
+}
+
+#[cfg(feature = "crypto-aws-lc")]
+#[rstest::rstest]
+#[case("unmatched-sni")]
+#[case("unmatched-port")]
+#[case("passthrough-port")]
+#[case("empty-policy")]
+#[case("http-rule")]
+#[case("before-network-authorization")]
+#[case("before-network-ext-authz")]
+#[case("before-gateway-ext-authz")]
+#[case("before-route-ext-authz")]
+#[case("before-cors")]
+#[case("before-route-match")]
+#[tokio::test]
+async fn substrate_egress_tls_denial_closes_at_client_hello_without_dialing(
+	#[case] kind: &str,
+	#[values(false, true)] http2: bool,
+) {
+	let (upstream, certs) = tls_mock().await;
+	let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+	let address = listener.local_addr().unwrap();
+	let port = address.port();
+	let upstream_address = *upstream.address();
+	let (connected, mut connections) = tokio::sync::mpsc::unbounded_channel();
+	let forwarding_listener = listener.clone();
+	let mut forwarder = tokio::spawn(async move {
+		loop {
+			let (mut downstream, _) = forwarding_listener.accept().await.unwrap();
+			connected.send(()).unwrap();
+			tokio::spawn(async move {
+				let mut upstream = TcpStream::connect(upstream_address).await.unwrap();
+				let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+			});
+		}
+	});
+
+	let authz = simple_mock().await;
+
+	// The same destination must work when allowed, then fail the TLS handshake
 	// without even opening a TCP connection when its policy disallows it.
 	for allowed in [true, false] {
 		let hostname = if !allowed && kind.starts_with("unmatched-sni") {
@@ -1875,7 +2686,7 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 		} else {
 			"localhost"
 		};
-		let rule_port = if !allowed && kind == "unmatched-port" {
+		let rule_port = if !allowed && matches!(kind, "unmatched-port" | "passthrough-port") {
 			if port == 443 { 444 } else { 443 }
 		} else {
 			port
@@ -1884,7 +2695,15 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 			numbers: vec![i32::from(rule_port)],
 			..Default::default()
 		});
-		let rule = if !allowed && kind == "http-rule" {
+		let rule = if !allowed && kind == "passthrough-port" {
+			protos::ateapi::EgressRule {
+				tls_passthrough: Some(protos::ateapi::TlsPassthroughRule {
+					hostnames: vec![hostname.to_owned()],
+					ports,
+				}),
+				..Default::default()
+			}
+		} else if !allowed && kind == "http-rule" {
 			protos::ateapi::EgressRule {
 				http: Some(protos::ateapi::HttpRule {
 					hostnames: vec![hostname.to_owned()],
@@ -1904,24 +2723,67 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 			}
 		};
 		let policy = EgressPolicy {
-			rules: if !allowed && kind == "empty-policy" {
+			rules: if !allowed && (kind == "empty-policy" || kind.starts_with("before-")) {
 				vec![]
 			} else {
 				vec![rule]
 			},
 			..Default::default()
 		};
-		let (gateway, _api) = substrate_tls_gateway(
+		let (mut gateway, _api) = substrate_tls_gateway(
 			Ok(policy),
+			ActorState::Running,
 			address,
 			Some(certs.root_cert.pem().into_bytes()),
 		)
 		.await;
+		let authz_policy = json!({
+			"host": authz.address().to_string(),
+			"protocol": { "http": {} }
+		});
+		match kind {
+			"before-network-authorization" => {
+				gateway
+					.attach_frontend_policy_with_port(
+						json!({
+							"networkAuthorization": { "rules": [if allowed { "true" } else { "false" }] }
+						}),
+						Some(port),
+					)
+					.await;
+			},
+			"before-network-ext-authz" => {
+				gateway
+					.attach_frontend_policy_with_port(json!({ "networkExtAuthz": authz_policy }), Some(port))
+					.await;
+			},
+			"before-gateway-ext-authz" => {
+				gateway
+					.attach_gateway_policy(json!({ "extAuthz": authz_policy }))
+					.await;
+			},
+			"before-route-ext-authz" => {
+				gateway
+					.attach_route_policy(json!({ "extAuthz": authz_policy }))
+					.await;
+			},
+			"before-cors" => {
+				gateway
+					.attach_route_policy(json!({
+						"cors": { "allowOrigins": ["http://example.com"], "allowMethods": ["GET"] }
+					}))
+					.await;
+			},
+			"before-route-match" if !allowed => {
+				gateway.pi.stores.binds.write().remove_route("route".into());
+			},
+			_ => {},
+		}
 		let io = open_actor_egress_tunnel(&gateway, port).await;
 		let tls: agentgateway::http::backendtls::BackendTLS =
 			agentgateway::http::backendtls::ResolvedBackendTLS {
 				root: Some(include_bytes!("../../../../examples/mcp-tls/certs/ca-cert.pem").to_vec()),
-				alpn: Some(vec!["http/1.1".to_owned()]),
+				alpn: Some(vec![if http2 { "h2" } else { "http/1.1" }.to_owned()]),
 				..Default::default()
 			}
 			.try_into()
@@ -1934,52 +2796,85 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 			),
 		)
 		.await
-		.expect("TLS handshake timed out")
-		.expect("gateway must complete TLS for HTTPS denial");
-		let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io))
-			.await
-			.unwrap();
-		let connection = tokio::spawn(connection);
-		let authority = if !allowed && kind == "unmatched-sni-allowed-authority" {
-			hostname
-		} else {
-			"localhost"
-		};
+		.expect("TLS handshake timed out");
+		if !allowed {
+			let err = io.expect_err("gateway must reject denied TLS at ClientHello");
+			assert!(
+				matches!(
+					err.kind(),
+					std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+				),
+				"expected connection closure at ClientHello, got {err}"
+			);
+			assert!(
+				connections.try_recv().is_err(),
+				"denied TLS opened an upstream connection"
+			);
+			assert!(
+				listener.accept().now_or_never().is_none(),
+				"denied TLS queued an upstream connection"
+			);
+			assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+			assert_eq!(
+				authz.received_requests().await.unwrap().len(),
+				usize::from(kind.ends_with("ext-authz")),
+				"denied TLS must not call auth services"
+			);
+			continue;
+		}
+		let io = io.expect("allowed TLS handshake failed");
+		let authority = "localhost";
 		let request = ::http::Request::builder()
-			.uri("/https-denial")
+			.method(Method::GET)
+			.uri(format!("https://{authority}/https-denial"))
 			.header(header::HOST, authority)
+			.header(header::ORIGIN, "http://example.com")
+			.header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
 			.body(Body::empty())
 			.unwrap();
-		let response = tokio::time::timeout(Duration::from_secs(3), sender.send_request(request))
-			.await
-			.unwrap()
-			.unwrap();
-		assert_eq!(
-			response.status(),
-			if allowed {
-				StatusCode::OK
+		let (response, connection) = tokio::time::timeout(Duration::from_secs(3), async {
+			if http2 {
+				let (mut sender, connection) =
+					hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+						.handshake(TokioIo::new(io))
+						.await
+						.unwrap();
+				let connection = tokio::spawn(connection);
+				(sender.send_request(request).await.unwrap(), connection)
 			} else {
-				StatusCode::FORBIDDEN
+				let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+					.await
+					.unwrap();
+				let connection = tokio::spawn(connection);
+				(sender.send_request(request).await.unwrap(), connection)
 			}
-		);
+		})
+		.await
+		.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		if kind == "before-cors" {
+			assert_eq!(
+				response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+				Some(&::http::HeaderValue::from_static("http://example.com"))
+			);
+		}
 		tokio::time::timeout(Duration::from_secs(3), response.into_body().collect())
 			.await
 			.unwrap()
 			.unwrap();
-		if allowed {
-			connections.recv().await.unwrap();
-		} else {
-			assert!(
-				tokio::time::timeout(Duration::from_millis(50), connections.recv())
-					.await
-					.is_err(),
-				"denied HTTPS opened an upstream connection"
-			);
-		}
+		connections.recv().await.unwrap();
 		assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+		assert_eq!(
+			authz.received_requests().await.unwrap().len(),
+			usize::from(kind.ends_with("ext-authz")),
+			"denied HTTPS must not call auth services"
+		);
 		connection.abort();
+		// Keep the listener open, but stop accepting before testing denial so
+		// an upstream dial cannot hide behind a delayed accept notification.
+		forwarder.abort();
+		assert!((&mut forwarder).await.unwrap_err().is_cancelled());
 	}
-	forwarder.abort();
 }
 
 #[cfg(feature = "crypto-aws-lc")]
@@ -1989,9 +2884,13 @@ async fn substrate_egress_https_denial_returns_403_without_dialing(#[case] kind:
 #[case("missing-sni")]
 #[case("missing-https-listener")]
 #[case("api-unavailable")]
+#[case("missing-policy")]
 #[case("static-backend")]
 #[tokio::test]
-async fn substrate_egress_rejects_unrecognized_or_unauthorized_connections(#[case] kind: &str) {
+async fn substrate_egress_rejects_unrecognized_or_unauthorized_connections(
+	#[case] kind: &str,
+	#[values(ActorState::Running, ActorState::Resuming)] state: ActorState,
+) {
 	let (upstream, _certs) = tls_mock().await;
 	let raw_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let address = if matches!(kind, "opaque" | "server-first" | "static-backend") {
@@ -2013,13 +2912,15 @@ async fn substrate_egress_rejects_unrecognized_or_unauthorized_connections(#[cas
 	};
 	let policy = if kind == "api-unavailable" {
 		Err(tonic::Status::unavailable("control API unavailable"))
+	} else if kind == "missing-policy" {
+		Err(tonic::Status::not_found("actor has no egress policy"))
 	} else {
 		Ok(EgressPolicy {
 			rules: vec![rule],
 			..Default::default()
 		})
 	};
-	let (gateway, _api) = substrate_tls_gateway(policy, address, None).await;
+	let (gateway, _api) = substrate_tls_gateway(policy, state, address, None).await;
 	let gateway = if kind == "static-backend" {
 		gateway.with_raw_backend(BackendWithPolicies {
 			backend: Backend::Opaque(
@@ -2080,9 +2981,296 @@ async fn substrate_egress_rejects_unrecognized_or_unauthorized_connections(#[cas
 	);
 }
 
+/// Records the `traceparent` each Substrate gRPC call receives, tagged by method.
+#[derive(Clone)]
+struct Traceparents<H> {
+	inner: H,
+	pending: Option<String>,
+	seen: Arc<StdMutex<Vec<(&'static str, String)>>>,
+}
+
+impl<H> Traceparents<H> {
+	fn new(inner: H, seen: Arc<StdMutex<Vec<(&'static str, String)>>>) -> Self {
+		Self {
+			inner,
+			pending: None,
+			seen,
+		}
+	}
+
+	fn stash(&mut self, metadata: &tonic::metadata::MetadataMap) {
+		self.pending = metadata
+			.get("traceparent")
+			.and_then(|v| v.to_str().ok())
+			.map(str::to_owned);
+	}
+
+	fn record(&mut self, method: &'static str) {
+		if let Some(tp) = self.pending.take() {
+			self.seen.lock().unwrap().push((method, tp));
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl ateapimock::Handler for Traceparents<CredentialEgressHandler> {
+	fn metadata(&mut self, metadata: &tonic::metadata::MetadataMap) {
+		self.stash(metadata);
+	}
+
+	async fn get_actor(
+		&mut self,
+		request: &protos::ateapi::GetActorRequest,
+	) -> Result<Actor, tonic::Status> {
+		self.record("GetActor");
+		self.inner.get_actor(request).await
+	}
+
+	async fn get_actor_egress_policy(
+		&mut self,
+		request: &protos::ateapi::GetActorEgressPolicyRequest,
+	) -> Result<EgressPolicy, tonic::Status> {
+		self.record("GetActorEgressPolicy");
+		self.inner.get_actor_egress_policy(request).await
+	}
+}
+
+#[async_trait::async_trait]
+impl credprovidermock::Handler for Traceparents<CredentialHandler> {
+	fn metadata(&mut self, metadata: &tonic::metadata::MetadataMap) {
+		self.stash(metadata);
+	}
+
+	async fn fetch_secret(
+		&mut self,
+		request: &protos::credprovider::FetchSecretRequest,
+	) -> Result<protos::credprovider::FetchSecretResponse, tonic::Status> {
+		self.record("FetchSecret");
+		self.inner.fetch_secret(request).await
+	}
+}
+
+struct CollectTraces(Arc<StdMutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>);
+
+#[async_trait::async_trait]
+impl oteltracemock::Handler for CollectTraces {
+	async fn export(
+		&mut self,
+		request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+	) -> Result<
+		opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+		tonic::Status,
+	> {
+		self.0.lock().unwrap().extend(
+			request
+				.resource_spans
+				.iter()
+				.flat_map(|resource| &resource.scope_spans)
+				.flat_map(|scope| &scope.spans)
+				.cloned(),
+		);
+		oteltracemock::ok_response()
+	}
+}
+
+fn hex_id(id: &[u8]) -> String {
+	id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn substrate_egress_propagates_trace_context_to_policy_and_credential_calls() {
+	unsafe {
+		// Drop export time to make tests fast
+		std::env::set_var("OTEL_BSP_SCHEDULE_DELAY", "20");
+	}
+	let spans = Arc::new(StdMutex::new(Vec::new()));
+	let otel = oteltracemock::OtelTraceMock::new({
+		let spans = spans.clone();
+		move || CollectTraces(spans.clone())
+	})
+	.spawn()
+	.await;
+	let upstream = simple_mock().await;
+	let port = upstream.address().port();
+	let policy = EgressPolicy {
+		rules: vec![protos::ateapi::EgressRule {
+			http: Some(protos::ateapi::HttpRule {
+				hostnames: vec!["localhost".to_owned()],
+				ports: Some(protos::ateapi::Ports {
+					numbers: vec![i32::from(port)],
+					..Default::default()
+				}),
+				effects: Some(protos::ateapi::HttpRuleEffects {
+					replace_headers: vec![protos::ateapi::CredentialHeader {
+						header: "authorization".to_owned(),
+						prefix: "Bearer ".to_owned(),
+						credential_uri: "ate-secret://kubernetes.io/default/upstream-token".to_owned(),
+						actor_jwt: None,
+					}],
+				}),
+			}),
+			..Default::default()
+		}],
+		..Default::default()
+	};
+	let seen = Arc::new(StdMutex::new(Vec::new()));
+	let api = ateapimock::AteApiMock::new({
+		let seen = seen.clone();
+		move || {
+			Traceparents::new(
+				CredentialEgressHandler {
+					policy: Ok(policy.clone()),
+					state: ActorState::Running,
+					mint_calls: None,
+					mint_delay: Duration::ZERO,
+					jwt_expiration_seconds: 600,
+				},
+				seen.clone(),
+			)
+		}
+	})
+	.spawn()
+	.await;
+	let credential_provider = credprovidermock::CredentialProviderMock::new({
+		let seen = seen.clone();
+		move || {
+			Traceparents::new(
+				CredentialHandler {
+					calls: Default::default(),
+				},
+				seen.clone(),
+			)
+		}
+	})
+	.spawn()
+	.await;
+
+	let mut outer = simple_bind();
+	outer.key = strng::literal!("outer");
+	outer.address = "127.0.0.1:15014".parse().unwrap();
+	let mut inner = simple_bind();
+	inner.address = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+	inner.mode = BindMode::Internal;
+	let mut gateway = crate::tests::dfp::setup_dfp_bind()
+		.with_bind(outer)
+		.with_bind(inner)
+		.with_connect_mode_on_port(agentgateway::types::frontend::ConnectMode::Tunnel, 15014);
+	gateway
+		.attach_frontend_policy(json!({
+			"tracing": { "host": otel.address.to_string() },
+			"substrateEgressActorResolution": {
+				"host": api.address.to_string(),
+			}
+		}))
+		.await;
+	gateway
+		.attach_route_policy(json!({
+			"substrateEgress": {
+				"host": api.address.to_string(),
+				"credentialProviders": [{
+					"uriAuthority": "kubernetes.io",
+					"target": { "host": credential_provider.address.to_string() }
+				}]
+			}
+		}))
+		.await;
+
+	let mut io = gateway.serve_tunnel_with_tls_info(
+		strng::literal!("outer"),
+		Some(TLSConnectionInfo {
+			src_identity: Some(TlsInfo {
+				certificate: Some(
+					actor_certificate("spiffe://substrate-actor.local/worker-for-actor/demo/my-actor").into(),
+				),
+				..Default::default()
+			}),
+			..Default::default()
+		}),
+	);
+	io.write_all(
+		format!("CONNECT 127.0.0.2:{port} HTTP/1.1\r\nHost: 127.0.0.2:{port}\r\n\r\n").as_bytes(),
+	)
+	.await
+	.unwrap();
+	let mut connect_response = [0; 128];
+	let response_len = io.read(&mut connect_response).await.unwrap();
+	assert!(
+		String::from_utf8_lossy(&connect_response[..response_len]).starts_with("HTTP/1.1 200 OK\r\n")
+	);
+
+	let client_tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+	io.write_all(
+		format!(
+			"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer actor-supplied\r\ntraceparent: {client_tp}\r\nConnection: close\r\n\r\n"
+		)
+		.as_bytes(),
+	)
+	.await
+	.unwrap();
+	let mut response = Vec::new();
+	tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut response))
+		.await
+		.expect("timed out waiting for tunneled response")
+		.unwrap();
+	assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"));
+
+	// CONNECT-time GetActor precedes any request trace, so only the two
+	// request-path calls carry one. Each continues the client's sampled trace
+	// under a gateway span.
+	let seen = seen.lock().unwrap().clone();
+	let methods: Vec<_> = seen.iter().map(|(method, _)| *method).collect();
+	assert_eq!(methods, ["GetActorEgressPolicy", "FetchSecret"], "{seen:?}");
+	for (method, tp) in &seen {
+		assert_eq!(tp[..36], client_tp[..36], "{method}: {tp}");
+		assert_ne!(tp[36..52], client_tp[36..52], "{method}: {tp}");
+		assert!(tp.ends_with("-01"), "{method}: {tp}");
+	}
+
+	// The traceparent each server received names that call's exported client
+	// span, which is a child of the gateway's request span.
+	tokio::time::timeout(Duration::from_secs(2), async {
+		while spans.lock().unwrap().len() < 3 {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for exported spans");
+	let spans = spans.lock().unwrap();
+	let request = spans
+		.iter()
+		.find(|span| hex_id(&span.parent_span_id) == client_tp[36..52])
+		.expect("request span should be exported");
+	for (method, tp) in &seen {
+		let path = match *method {
+			"GetActorEgressPolicy" => "/substrate.ateapi.v1.Control/GetActorEgressPolicy",
+			"FetchSecret" => "/substrate.credprovider.v1.CredentialProvider/FetchSecret",
+			other => panic!("unexpected method {other}"),
+		};
+		let span = spans
+			.iter()
+			.find(|span| {
+				span.name == "Substrate"
+					&& span.attributes.iter().any(|attribute| {
+						attribute.key == "http.path"
+							&& matches!(
+								attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+								Some(
+									opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+										value
+									)
+								) if value == path
+							)
+					})
+			})
+			.unwrap_or_else(|| panic!("{path} span should be exported"));
+		assert_eq!(hex_id(&span.span_id), tp[36..52], "{path}");
+		assert_eq!(span.parent_span_id, request.span_id, "{path}");
+	}
+}
+
 #[tokio::test]
 async fn substrate_egress_rejects_invalid_or_unavailable_actors_at_connect_time() {
-	let running = ActorState::Running;
+	let running = Some(ActorState::Running as i32);
 	assert_eq!(
 		substrate_egress_connect_status(
 			EgressHandler {
@@ -2090,38 +3278,31 @@ async fn substrate_egress_rejects_invalid_or_unavailable_actors_at_connect_time(
 				state: running,
 				error: Some(tonic::Code::NotFound)
 			},
-			"spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor",
+			"spiffe://substrate-actor.local/worker-for-actor/demo/my-actor",
 			b"",
 		)
 		.await,
 		StatusCode::FORBIDDEN,
 	);
-	assert_eq!(
-		substrate_egress_connect_status(
-			EgressHandler {
-				uid: "uid-1",
-				state: running,
-				error: None
-			},
-			"spiffe://substrate-actor.local/actor/demo/my-actor",
-			b"",
-		)
-		.await,
-		StatusCode::FORBIDDEN,
-	);
-	assert_eq!(
-		substrate_egress_connect_status(
-			EgressHandler {
-				uid: "uid-1",
-				state: ActorState::Suspended,
-				error: None
-			},
-			"spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor",
-			b"",
-		)
-		.await,
-		StatusCode::FORBIDDEN,
-	);
+	for uri in [
+		"spiffe://substrate-actor.local/actor/demo/my-actor",
+		"spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor",
+	] {
+		assert_eq!(
+			substrate_egress_connect_status(
+				EgressHandler {
+					uid: "uid-1",
+					state: running,
+					error: None
+				},
+				uri,
+				b"",
+			)
+			.await,
+			StatusCode::FORBIDDEN,
+			"{uri}",
+		);
+	}
 	assert_eq!(
 		substrate_egress_connect_status(
 			EgressHandler {
@@ -2129,7 +3310,7 @@ async fn substrate_egress_rejects_invalid_or_unavailable_actors_at_connect_time(
 				state: running,
 				error: Some(tonic::Code::Unavailable)
 			},
-			"spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor",
+			"spiffe://substrate-actor.local/worker-for-actor/demo/my-actor",
 			b"",
 		)
 		.await,
@@ -2138,7 +3319,55 @@ async fn substrate_egress_rejects_invalid_or_unavailable_actors_at_connect_time(
 }
 
 #[tokio::test]
-async fn substrate_egress_accepts_valid_actor_connect_before_protocol_detection() {
+async fn substrate_egress_reports_an_unreachable_actor_service_as_unavailable() {
+	let closed = UNREACHABLE_ADDR.parse().unwrap();
+	assert_eq!(
+		substrate_egress_connect_status_at(
+			closed,
+			"spiffe://substrate-actor.local/worker-for-actor/demo/my-actor",
+			b"",
+		)
+		.await,
+		StatusCode::SERVICE_UNAVAILABLE,
+	);
+}
+
+#[rstest::rstest]
+#[case::unspecified(Some(ActorState::Unspecified as i32))]
+#[case::suspending(Some(ActorState::Suspending as i32))]
+#[case::suspended(Some(ActorState::Suspended as i32))]
+#[case::pausing(Some(ActorState::Pausing as i32))]
+#[case::paused(Some(ActorState::Paused as i32))]
+#[case::crashed(Some(ActorState::Crashed as i32))]
+#[case::deleting(Some(ActorState::Deleting as i32))]
+#[case::unknown(Some(999))]
+#[case::missing_status(None)]
+#[tokio::test]
+async fn substrate_egress_rejects_actor_states_without_worker_placement(
+	#[case] state: Option<i32>,
+) {
+	assert_eq!(
+		substrate_egress_connect_status(
+			EgressHandler {
+				uid: "uid-1",
+				state,
+				error: None,
+			},
+			"spiffe://substrate-actor.local/worker-for-actor/demo/my-actor",
+			b"",
+		)
+		.await,
+		StatusCode::FORBIDDEN,
+	);
+}
+
+#[rstest::rstest]
+#[case::running(ActorState::Running)]
+#[case::resuming(ActorState::Resuming)]
+#[tokio::test]
+async fn substrate_egress_accepts_valid_actor_connect_before_protocol_detection(
+	#[case] state: ActorState,
+) {
 	for payload in [
 		b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n".as_slice(),
 		b"\x16\x03\x03\x00\x01\x00".as_slice(),
@@ -2148,134 +3377,14 @@ async fn substrate_egress_accepts_valid_actor_connect_before_protocol_detection(
 			substrate_egress_connect_status(
 				EgressHandler {
 					uid: "uid-1",
-					state: ActorState::Running,
+					state: Some(state as i32),
 					error: None
 				},
-				"spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor",
+				"spiffe://substrate-actor.local/worker-for-actor/demo/my-actor",
 				payload,
 			)
 			.await,
 			StatusCode::OK,
 		);
 	}
-}
-
-#[tokio::test]
-async fn substrate_egress_actor_resolution_refreshes_on_long_lived_tunnel() {
-	#[derive(Clone)]
-	struct CountingHandler {
-		calls: Arc<AtomicUsize>,
-	}
-
-	#[async_trait::async_trait]
-	impl ateapimock::Handler for CountingHandler {
-		async fn get_actor(
-			&mut self,
-			_request: &protos::ateapi::GetActorRequest,
-		) -> Result<Actor, tonic::Status> {
-			self.calls.fetch_add(1, Ordering::Relaxed);
-			Ok(Actor {
-				metadata: Some(ResourceMetadata {
-					uid: "uid-1".to_owned(),
-					..Default::default()
-				}),
-				status: Some(ActorStatus {
-					state: ActorState::Running as i32,
-					worker_assignment: None,
-				}),
-			})
-		}
-	}
-
-	let first_calls = Arc::new(AtomicUsize::new(0));
-	let first_api = ateapimock::AteApiMock::new({
-		let calls = first_calls.clone();
-		move || CountingHandler {
-			calls: calls.clone(),
-		}
-	})
-	.spawn()
-	.await;
-	let second_calls = Arc::new(AtomicUsize::new(0));
-	let second_api = ateapimock::AteApiMock::new({
-		let calls = second_calls.clone();
-		move || CountingHandler {
-			calls: calls.clone(),
-		}
-	})
-	.spawn()
-	.await;
-
-	let mut outer = simple_bind();
-	outer.key = strng::literal!("outer");
-	outer.address = "127.0.0.1:15012".parse().unwrap();
-	let mut inner = simple_bind();
-	inner.address = "0.0.0.0:18080".parse().unwrap();
-	inner.mode = BindMode::Internal;
-	let mut gateway = setup_proxy_test("{}")
-		.unwrap()
-		.with_bind(outer)
-		.with_bind(inner)
-		.with_connect_mode_on_port(agentgateway::types::frontend::ConnectMode::Tunnel, 15012);
-	gateway
-		.attach_frontend_policy(json!({
-			"substrateEgressActorResolution": {
-				"host": first_api.address.to_string(),
-			}
-		}))
-		.await;
-
-	let io = gateway.serve_tunnel_with_tls_info(
-		strng::literal!("outer"),
-		Some(TLSConnectionInfo {
-			src_identity: Some(TlsInfo {
-				certificate: Some(
-					actor_certificate("spiffe://substrate-actor.local/ateom-for-actor/demo/my-actor").into(),
-				),
-				..Default::default()
-			}),
-			..Default::default()
-		}),
-	);
-	let (mut sender, connection) =
-		hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-			.handshake(hyper_util::rt::TokioIo::new(io))
-			.await
-			.unwrap();
-	let connection = tokio::spawn(connection);
-
-	let connect = || {
-		::http::Request::builder()
-			.method(Method::CONNECT)
-			.uri("allowed.example:18080")
-			.body(Body::empty())
-			.unwrap()
-	};
-	assert_eq!(
-		sender.send_request(connect()).await.unwrap().status(),
-		StatusCode::OK
-	);
-	assert_eq!(first_calls.load(Ordering::Relaxed), 1);
-
-	gateway
-		.pi
-		.stores
-		.binds
-		.write()
-		.remove_policy(strng::literal!("pol/1"));
-	gateway
-		.attach_frontend_policy(json!({
-			"substrateEgressActorResolution": {
-				"host": second_api.address.to_string(),
-			}
-		}))
-		.await;
-
-	assert_eq!(
-		sender.send_request(connect()).await.unwrap().status(),
-		StatusCode::OK
-	);
-	assert_eq!(first_calls.load(Ordering::Relaxed), 1);
-	assert_eq!(second_calls.load(Ordering::Relaxed), 1);
-	connection.abort();
 }

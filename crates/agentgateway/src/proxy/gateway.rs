@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use agent_core::drain::{DrainUpgrader, DrainWatcher};
@@ -14,7 +15,7 @@ use bytes::Bytes;
 use futures::pin_mut;
 use futures_util::FutureExt;
 use futures_util::future::{self, Either};
-use http::StatusCode;
+use http::{HeaderValue, StatusCode, Version, header};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use rand::RngExt;
@@ -25,12 +26,14 @@ use tokio_stream::StreamExt;
 use tracing::{Instrument, debug, error, event, info, info_span, warn};
 
 use crate::http::substrate::{self, ActorIdentity, EgressTlsMode};
+use crate::management::metrics_server::MetricsService;
 use crate::proxy::{ProxyError, WaypointService, dtrace};
 use crate::store::{BindEvent, BindListeners, FrontendPolices};
 use crate::telemetry::metrics::{AdmissionLabels, TCPLabels};
 use crate::transport::BufferLimit;
 use crate::transport::stream::{
-	ConnectHeaders, Extension, LoggingMode, Socket, TCPConnectionInfo, TLSConnectionInfo,
+	ConnectAuthority, ConnectHeaders, Extension, LoggingMode, Socket, TCPConnectionInfo,
+	TLSConnectionInfo,
 };
 use crate::types::agent::{
 	BindKey, BindProtocol, Listener, ListenerProtocol, TransportProtocol, TunnelProtocol,
@@ -38,6 +41,10 @@ use crate::types::agent::{
 use crate::types::discovery::Service;
 use crate::types::frontend;
 use crate::{ProxyInputs, Stores, client};
+
+// Every in-flight request holds this future until it completes, so its size is paid per
+// concurrent request. A larger future usually means some value is now held across an await.
+const PROXY_REQUEST_FUTURE_SIZE: usize = 18 * 1024;
 
 #[cfg(test)]
 #[path = "gateway_test.rs"]
@@ -73,13 +80,6 @@ impl HboneAddress {
 		match self {
 			HboneAddress::SocketAddr(_) => None,
 			HboneAddress::SvcHostname(s, _) => Some(s.clone()),
-		}
-	}
-
-	pub fn hostname_addr(&self) -> Option<Arc<str>> {
-		match self {
-			HboneAddress::SocketAddr(_) => None,
-			HboneAddress::SvcHostname(_, _) => Some(Arc::from(self.to_string())),
 		}
 	}
 
@@ -283,6 +283,7 @@ impl Gateway {
 		let listener = tokio::net::TcpListener::from_std(listener)?;
 		info!(bind = name.as_str(), "started bind");
 		let component = format!("bind {name}");
+		let drain_observer = drain.observer();
 
 		// Desired drain semantics:
 		// A drain will start when SIGTERM is sent.
@@ -317,6 +318,7 @@ impl Gateway {
 					// Can fail if they immediately disconnected; not much we can do.
 					return;
 				};
+				stream.ext_mut().insert(drain_observer.clone());
 				stream.with_logging(LoggingMode::Downstream);
 				let pi = pi.clone();
 				// We got the connection; make a strong drain blocker.
@@ -408,12 +410,6 @@ impl Gateway {
 		drain: DrainWatcher,
 	) {
 		let policies = Self::frontend_policies_for_bind(&bind_name, &inputs);
-		// Classify actor traffic from the inner bytes, independently of its port or outer TLS.
-		let bind_protocol = if raw_stream.ext::<ActorIdentity>().is_some() {
-			BindProtocol::auto
-		} else {
-			bind_protocol
-		};
 
 		let peer_addr = raw_stream.tcp().peer_addr;
 		event!(
@@ -753,12 +749,12 @@ impl Gateway {
 					crate::http::mark_sensitive_headers(&mut req, &inputs.cfg.sensitive_headers);
 					let connect_headers = req.headers().clone();
 					let authority = match req.uri().authority() {
-						Some(authority) => authority.as_str(),
+						Some(authority) => authority.clone(),
 						None => return Ok(ProxyError::InvalidRequest.into_response_with_grpc(false)),
 					};
 					let (target_address, bind) = {
 						let binds = inputs.stores.read_binds();
-						if let Ok(addr) = authority.parse::<SocketAddr>() {
+						if let Ok(addr) = authority.as_str().parse::<SocketAddr>() {
 							// CONNECT re-entry must not expose a bind scoped to a concrete address
 							// (for example, a loopback-only listener). Match only an unspecified-address
 							// bind for this port; otherwise fall back to the explicit internal wildcard
@@ -799,12 +795,7 @@ impl Gateway {
 							.await
 						{
 							Ok(identity) => Some(identity),
-							Err(error) => {
-								return Ok(match error {
-									crate::proxy::ProxyResponse::Error(error) => error.into_response_with_grpc(false),
-									crate::proxy::ProxyResponse::DirectResponse(response) => *response,
-								});
-							},
+							Err(error) => return Ok(error.into_response_with_grpc(false)),
 						}
 					} else {
 						None
@@ -838,6 +829,7 @@ impl Gateway {
 							downstream.ext_mut().insert(policy);
 						}
 						downstream.ext_mut().insert(ConnectHeaders(connect_headers));
+						downstream.ext_mut().insert(ConnectAuthority(authority));
 						if let Some(buffer) = buffer {
 							downstream.ext_mut().insert(BufferLimit::new(buffer));
 						}
@@ -957,7 +949,8 @@ impl Gateway {
 		let max_connection_duration = policies
 			.http
 			.as_ref()
-			.and_then(|h| h.max_connection_duration);
+			.and_then(|h| h.max_connection_duration)
+			.map(crate::client::jittered);
 		let max_requests = policies
 			.http
 			.as_ref()
@@ -972,21 +965,33 @@ impl Gateway {
 			})
 			.clone();
 		let drain_proxy = proxy.clone();
+		let drain_observer = stream.ext::<drain::DrainObserver>().cloned();
+		// Set once max_connection_duration is reached, asking HTTP/1 clients to close.
+		let close_connection = Arc::new(AtomicBool::new(false));
+		let service_close_connection = close_connection.clone();
 
 		let serve = server.serve_connection_with_upgrades(
 			TokioIo::new(stream),
 			hyper::service::service_fn(move |mut req| {
 				let proxy = proxy.clone();
 				let connection = connection.clone();
+				let drain_observer = drain_observer.clone();
+				let close_connection = service_close_connection.clone();
+				let is_http1 = matches!(req.version(), Version::HTTP_10 | Version::HTTP_11);
 
 				// Ensure we have capacity before we allocate the large proxy future.
 				let Some(request_permit) = request_admission.requests.try_acquire(max_requests) else {
 					request_shed.inc();
 					let is_grpc = crate::http::is_grpc_request(&req);
 					debug!(bind = %proxy.bind_name, "request rejected: request limit");
-					return Either::Left(future::ready(Ok::<_, Infallible>(
-						ProxyError::RequestLimitExceeded.into_response_with_grpc(is_grpc),
-					)));
+					let mut response = ProxyError::RequestLimitExceeded.into_response_with_grpc(is_grpc);
+					close_if_draining(
+						is_http1,
+						drain_observer.as_ref(),
+						&close_connection,
+						&mut response,
+					);
+					return Either::Left(future::ready(Ok::<_, Infallible>(response)));
 				};
 
 				if let Some(buffer) = buffer {
@@ -995,15 +1000,21 @@ impl Gateway {
 				let req = req.map(crate::http::Body::new);
 
 				Either::Right(async move {
-					let response = telemetry::request_scope(
+					let mut response = telemetry::request_scope(
 						// This is the per-request HTTP flow future. It is the baseline task state
 						// multiplied by concurrent in-flight requests on this connection.
 						dtrace::DebugTracer::maybe_scope(req, |req| async move {
 							proxy.proxy(connection, req).map(Ok::<_, Infallible>).await
 						})
-						.assert_size::<{ 18 * 1024 }>(),
+						.assert_size::<{ PROXY_REQUEST_FUTURE_SIZE }>(),
 					)
 					.await?;
+					close_if_draining(
+						is_http1,
+						drain_observer.as_ref(),
+						&close_connection,
+						&mut response,
+					);
 					Ok(response.map(|body| body.with_drop_guard(request_permit)))
 				})
 			}),
@@ -1016,7 +1027,12 @@ impl Gateway {
 		let watch_connection_drain = async move {
 			let max_connection_duration = async {
 				match max_connection_duration {
-					Some(d) => tokio::time::sleep(d).await,
+					Some(d) => {
+						tokio::time::sleep(d).await;
+						debug!("max connection duration reached, closing connection after next response");
+						close_connection.store(true, Ordering::Relaxed);
+						tokio::time::sleep(MAX_CONNECTION_DURATION_GRACE).await;
+					},
 					None => std::future::pending::<()>().await,
 				}
 			};
@@ -1177,7 +1193,7 @@ impl Gateway {
 			.read_binds()
 			.get_bind_listener(bind_name, &serving_listener.key)
 		{
-			Some(current) => current.as_ref() != serving_listener,
+			Some(current) => !current.serving_eq(serving_listener),
 			None => true,
 		}
 	}
@@ -1232,7 +1248,7 @@ impl Gateway {
 			.await?;
 			let best = listeners
 				.best_match_filtered(sni, |protocol| match egress_mode {
-					Some(EgressTlsMode::Intercept | EgressTlsMode::InterceptDenied) => {
+					Some(EgressTlsMode::Intercept) => {
 						matches!(protocol, ListenerProtocol::HTTPS(_))
 					},
 					Some(EgressTlsMode::Passthrough) => matches!(protocol, ListenerProtocol::TLS(None)),
@@ -1518,6 +1534,7 @@ impl Gateway {
 					},
 					hostname: Default::default(),
 					protocol: ListenerProtocol::HBONE,
+					..Default::default()
 				})
 			});
 
@@ -1663,6 +1680,9 @@ impl Gateway {
 		// HBONE re-entry bypasses the listening socket, so it must not expose binds
 		// scoped to a concrete address (for example, a loopback-only listener).
 		let Some(bind) = pi.stores.read_binds().find_bind_by_port(socket_addr.port()) else {
+			if let Some(stats) = Self::stats_for_port(&pi, socket_addr.port()) {
+				return Self::serve_stats(stats, req).await;
+			}
 			warn!("no bind for {hbone_addr}");
 			let Ok(_) = req
 				.send_response(build_response(StatusCode::NOT_FOUND))
@@ -1691,6 +1711,29 @@ impl Gateway {
 			drain,
 		)
 		.await
+	}
+
+	fn stats_for_port(pi: &ProxyInputs, port: u16) -> Option<MetricsService> {
+		pi.stats
+			.clone()
+			.filter(|_| pi.cfg.stats_addr.wildcard_port() == Some(port))
+	}
+
+	/// Serves the metrics endpoint over an HBONE tunnel addressed to the stats port, as ztunnel
+	/// exposes a captured pod's own ports to the mesh. No bind, so no routes or policies apply.
+	async fn serve_stats(stats: MetricsService, req: H2Request) {
+		let Ok(resp) = req.send_response(build_response(StatusCode::OK)).await else {
+			warn!("failed to send response");
+			return;
+		};
+		let con = agent_hbone::RWStream {
+			stream: resp,
+			buf: Bytes::new(),
+			drain_tx: None,
+		};
+		if let Err(e) = stats.serve_connection(con).await {
+			debug!("hbone stats connection closed: {e}");
+		}
 	}
 }
 
@@ -1766,6 +1809,7 @@ pub fn auto_server(c: Option<&frontend::HTTP>) -> auto::Builder<::hyper_util::rt
 		http2_keepalive_timeout,
 		max_connection_duration: _, // Not handled here
 		max_concurrent_requests: _, // Not handled here
+		normalize: _,               // Not handled here
 	} = c.unwrap_or(&def);
 
 	if let Some(m) = http1_max_headers {
@@ -1820,6 +1864,29 @@ fn is_accept_error_per_connection(e: &std::io::Error) -> bool {
 		e.raw_os_error(),
 		Some(libc::ECONNABORTED | libc::ECONNRESET | libc::EPERM)
 	)
+}
+
+/// How long an HTTP/1 connection past max_connection_duration may serve a final
+/// `Connection: close` response before it is closed.
+const MAX_CONNECTION_DURATION_GRACE: Duration = Duration::from_secs(10);
+
+/// During drain, or once max_connection_duration is reached, ask HTTP/1 clients to close
+/// the connection after this response.
+/// An existing Connection header (such as `upgrade` on a 101) is left untouched.
+fn close_if_draining<B>(
+	is_http1: bool,
+	drain: Option<&drain::DrainObserver>,
+	close_connection: &AtomicBool,
+	response: &mut ::http::Response<B>,
+) {
+	if is_http1
+		&& (close_connection.load(Ordering::Relaxed) || drain.is_some_and(|d| d.is_draining()))
+	{
+		response
+			.headers_mut()
+			.entry(header::CONNECTION)
+			.or_insert(HeaderValue::from_static("close"));
+	}
 }
 
 fn should_ignore_downstream_connection_error(err: &(dyn StdError + 'static)) -> bool {

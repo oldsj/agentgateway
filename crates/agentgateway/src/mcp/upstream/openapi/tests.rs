@@ -36,6 +36,7 @@ async fn setup_with_prefix(prefix: &str) -> (MockServer, Handler) {
 		&client::Config {
 			resolver_cfg: ResolverConfig::default(),
 			resolver_opts: ResolverOpts::default(),
+			max_ttl: None,
 		},
 		None,
 		BackendConfig::default(),
@@ -51,6 +52,7 @@ async fn setup_with_prefix(prefix: &str) -> (MockServer, Handler) {
 		)),
 		model_catalog: crate::llm::catalog::ModelCatalog::empty(),
 		admin: None,
+		stats: None,
 		upstream: client.clone(),
 		ca: None,
 		spiffe: None,
@@ -273,7 +275,10 @@ async fn test_call_tool_full_url_server_prefix() {
 		result.is_ok(),
 		"full-URL server prefix should not cause invalid authority"
 	);
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -306,7 +311,10 @@ async fn test_call_tool_path_prefix_server() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -332,7 +340,40 @@ async fn test_call_tool_get_simple_success() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
+}
+
+#[rstest]
+#[case::replace("/api")]
+#[case::trailing_slash("/api/")]
+#[tokio::test]
+async fn test_call_tool_configured_path_prefix(#[case] prefix: &str) {
+	let (server, handler) = setup_with_prefix(prefix).await;
+	let expected_response = json!({ "id": "123", "name": "Test User" });
+	Mock::given(method("GET"))
+		.and(path("/api/users/123"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(&expected_response))
+		.expect(1)
+		.mount(&server)
+		.await;
+
+	let result = handler
+		.call_tool(
+			"get_user",
+			Some(
+				json!({ "path": { "user_id": "123" } })
+					.as_object()
+					.unwrap()
+					.clone(),
+			),
+			&IncomingRequestContext::empty(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(result.structured_content.unwrap(), expected_response);
 }
 
 #[tokio::test]
@@ -361,7 +402,10 @@ async fn test_call_tool_get_with_query() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -389,7 +433,10 @@ async fn test_call_tool_get_with_header() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -416,7 +463,10 @@ async fn test_call_tool_post_with_body() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -451,7 +501,10 @@ async fn test_call_tool_post_all_params() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -499,7 +552,7 @@ async fn test_call_tool_upstream_error() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), error_response);
+	assert_eq!(result.unwrap().structured_content.unwrap(), error_response);
 }
 
 #[tokio::test]
@@ -561,7 +614,10 @@ async fn test_call_tool_invalid_header_value() {
 		)
 		.await;
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), json!({ "id": user_id }));
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		json!({ "id": user_id })
+	);
 }
 
 #[tokio::test]
@@ -592,7 +648,10 @@ async fn test_call_tool_invalid_query_param_value() {
 		)
 		.await;
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), json!({ "id": user_id }));
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		json!({ "id": user_id })
+	);
 }
 
 #[tokio::test]
@@ -648,7 +707,10 @@ async fn test_call_tool_with_compressed_response() {
 		.await;
 
 	assert!(result.is_ok());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -667,11 +729,6 @@ async fn test_call_tool_response_wrapping() {
 			true,
 			br#"[{"id":1,"name":"1"},{"id":2,"name":"2"},{"id":3,"name":"3"}]"#,
 			json!([ { "id": 1, "name": "1" }, { "id": 2, "name": "2" }, { "id": 3, "name": "3" }]),
-		),
-		(
-			false,
-			b"plain text response",
-			json!({"code": 200, "message": "plain text response"}),
 		),
 		(true, b"42", json!(42)),
 		(true, b"true", json!(true)),
@@ -703,8 +760,242 @@ async fn test_call_tool_response_wrapping() {
 		} else {
 			response.clone()
 		};
-		assert_eq!(result.unwrap(), expected);
+		assert_eq!(result.unwrap().structured_content.unwrap(), expected);
 	}
+}
+
+#[tokio::test]
+async fn test_call_tool_image_response() {
+	let (server, handler) = setup().await;
+
+	// PNG signature followed by bytes that are not valid UTF-8
+	let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe";
+
+	Mock::given(method("GET"))
+		.and(path("/users/img"))
+		.respond_with(
+			ResponseTemplate::new(200)
+				.insert_header("content-type", "image/png; charset=binary")
+				.set_body_bytes(png.to_vec()),
+		)
+		.mount(&server)
+		.await;
+
+	let args = json!({ "path": { "user_id": "img" } });
+	let result = handler
+		.call_tool(
+			"get_user",
+			Some(args.as_object().unwrap().clone()),
+			&IncomingRequestContext::empty(),
+		)
+		.await
+		.unwrap();
+
+	assert!(result.structured_content.is_none());
+	assert_eq!(result.content.len(), 1);
+	let rmcp::model::ContentBlock::Image(image) = &result.content[0] else {
+		panic!("expected image content, got {:?}", result.content[0]);
+	};
+	use base64::Engine;
+	assert_eq!(image.mime_type, "image/png");
+	assert_eq!(
+		image.data,
+		base64::engine::general_purpose::STANDARD.encode(png)
+	);
+}
+
+async fn mount_body(server: &MockServer, user_id: &str, content_type: Option<&str>, body: &[u8]) {
+	let mut resp = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+	if let Some(ct) = content_type {
+		resp = resp.insert_header("content-type", ct);
+	}
+	Mock::given(method("GET"))
+		.and(path(format!("/users/{user_id}")))
+		.respond_with(resp)
+		.mount(server)
+		.await;
+}
+
+async fn call_get_user(handler: &Handler, user_id: &str) -> CallToolResult {
+	let args = json!({ "path": { "user_id": user_id } });
+	handler
+		.call_tool(
+			"get_user",
+			Some(args.as_object().unwrap().clone()),
+			&IncomingRequestContext::empty(),
+		)
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn test_call_tool_non_json_text_returns_text_block() {
+	let (server, handler) = setup().await;
+	let body = "<html><body>not json</body></html>";
+
+	for (id, content_type) in [
+		("html", Some("text/html; charset=utf-8")),
+		("xhtml", Some("application/xhtml+xml")),
+		("svg", Some("image/svg+xml")),
+		("js", Some("application/javascript")),
+		("form", Some("application/x-www-form-urlencoded")),
+		("sql", Some("application/sql")),
+		("eml", Some("message/rfc822")),
+		("none", None),
+	] {
+		mount_body(&server, id, content_type, body.as_bytes()).await;
+		let result = call_get_user(&handler, id).await;
+
+		assert!(result.structured_content.is_none(), "{id}");
+		assert_eq!(result.content.len(), 1, "{id}");
+		let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+			panic!(
+				"expected text content for {id}, got {:?}",
+				result.content[0]
+			);
+		};
+		assert_eq!(text.text, body, "{id}");
+	}
+}
+
+#[tokio::test]
+async fn test_call_tool_json_in_text_content_type_is_parsed() {
+	let (server, handler) = setup().await;
+	mount_body(&server, "mislabelled", Some("text/plain"), br#"{"id":"x"}"#).await;
+
+	let result = call_get_user(&handler, "mislabelled").await;
+
+	assert_eq!(result.structured_content, Some(json!({ "id": "x" })));
+	let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+		panic!("expected text content, got {:?}", result.content[0]);
+	};
+	assert_eq!(
+		serde_json::from_str::<Value>(&text.text).unwrap(),
+		json!({ "id": "x" })
+	);
+}
+
+#[tokio::test]
+async fn test_call_tool_audio_response() {
+	let (server, handler) = setup().await;
+	let mp3: &[u8] = b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb";
+	mount_body(&server, "audio", Some("audio/mpeg"), mp3).await;
+
+	let result = call_get_user(&handler, "audio").await;
+
+	assert!(result.structured_content.is_none());
+	assert_eq!(result.content.len(), 1);
+	let rmcp::model::ContentBlock::Audio(audio) = &result.content[0] else {
+		panic!("expected audio content, got {:?}", result.content[0]);
+	};
+	use base64::Engine;
+	assert_eq!(audio.mime_type, "audio/mpeg");
+	assert_eq!(
+		audio.data,
+		base64::engine::general_purpose::STANDARD.encode(mp3)
+	);
+}
+
+#[tokio::test]
+async fn test_call_tool_binary_response_is_blob_resource() {
+	let (server, handler) = setup().await;
+	let bytes: &[u8] = b"%PDF-1.7\n\xff\xfe\x00\x80binary";
+
+	for (id, content_type) in [
+		("octet", "application/octet-stream"),
+		("pdf", "application/pdf"),
+		("multipart", "multipart/form-data"),
+		("proto", "application/x-protobuf"),
+	] {
+		mount_body(&server, id, Some(content_type), bytes).await;
+		let result = call_get_user(&handler, id).await;
+
+		assert!(result.structured_content.is_none(), "{id}");
+		assert_eq!(result.content.len(), 1, "{id}");
+		let rmcp::model::ContentBlock::Resource(res) = &result.content[0] else {
+			panic!(
+				"expected resource content for {id}, got {:?}",
+				result.content[0]
+			);
+		};
+		let ResourceContents::BlobResourceContents {
+			uri,
+			mime_type,
+			blob,
+			..
+		} = &res.resource
+		else {
+			panic!("expected blob resource for {id}, got {:?}", res.resource);
+		};
+		use base64::Engine;
+		assert_eq!(uri, "tool://get_user");
+		assert_eq!(mime_type.as_deref(), Some(content_type), "{id}");
+		assert_eq!(
+			*blob,
+			base64::engine::general_purpose::STANDARD.encode(bytes),
+			"{id}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn test_call_tool_octet_stream_ascii_body_is_text() {
+	let (server, handler) = setup().await;
+	mount_body(
+		&server,
+		"ascii",
+		Some("application/octet-stream"),
+		b"id,name\n1,ascii\n",
+	)
+	.await;
+
+	let result = call_get_user(&handler, "ascii").await;
+
+	let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+		panic!("expected text content, got {:?}", result.content[0]);
+	};
+	assert_eq!(text.text, "id,name\n1,ascii\n");
+}
+
+#[tokio::test]
+async fn test_call_tool_untyped_binary_body_is_blob_resource() {
+	let (server, handler) = setup().await;
+	let bytes: &[u8] = b"\x89PNG\r\n\x1a\n\xff\xfe";
+	mount_body(&server, "untyped", None, bytes).await;
+
+	let result = call_get_user(&handler, "untyped").await;
+
+	assert!(result.structured_content.is_none());
+	let rmcp::model::ContentBlock::Resource(res) = &result.content[0] else {
+		panic!("expected resource content, got {:?}", result.content[0]);
+	};
+	let rmcp::model::ResourceContents::BlobResourceContents {
+		uri,
+		mime_type,
+		blob,
+		..
+	} = &res.resource
+	else {
+		panic!("expected blob resource, got {:?}", res.resource);
+	};
+	use base64::Engine;
+	assert_eq!(uri, "tool://get_user");
+	assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+	assert_eq!(
+		*blob,
+		base64::engine::general_purpose::STANDARD.encode(bytes)
+	);
+}
+
+#[tokio::test]
+async fn test_call_tool_empty_body_returns_no_content() {
+	let (server, handler) = setup().await;
+	mount_body(&server, "empty", Some("image/png"), b"").await;
+
+	let result = call_get_user(&handler, "empty").await;
+
+	assert!(result.content.is_empty());
+	assert!(result.structured_content.is_none());
 }
 
 #[tokio::test]
@@ -1275,7 +1566,10 @@ async fn test_query_param_types(
 		.await;
 
 	assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
-	assert_eq!(result.unwrap(), json!({ "id": user_id }));
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		json!({ "id": user_id })
+	);
 }
 
 #[rstest]
@@ -1312,7 +1606,10 @@ async fn test_path_param_encoding(#[case] user_id: &str, #[case] expected_path: 
 		.await;
 
 	assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
-	assert_eq!(result.unwrap(), json!({ "id": user_id }));
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		json!({ "id": user_id })
+	);
 }
 
 #[rstest]
@@ -1442,7 +1739,10 @@ async fn test_schema_defined_headers_work() {
 		"Schema-defined headers should work: {:?}",
 		result.err()
 	);
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 // Custom matcher to verify a header is NOT present
@@ -1502,7 +1802,10 @@ async fn test_blocked_headers_are_ignored() {
 
 	// The request should succeed with the correct headers (blocked headers ignored)
 	assert!(result.is_ok(), "Request should succeed: {:?}", result.err());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -1543,7 +1846,10 @@ async fn test_headers_not_in_schema_are_ignored() {
 		"Request should succeed with schema-defined headers: {:?}",
 		result.err()
 	);
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
 }
 
 #[tokio::test]
@@ -1751,6 +2057,7 @@ async fn test_openapi_from_url() {
 		&client::Config {
 			resolver_cfg: ResolverConfig::default(),
 			resolver_opts: ResolverOpts::default(),
+			max_ttl: None,
 		},
 		None,
 		BackendConfig::default(),
@@ -2049,6 +2356,7 @@ async fn test_call_tool_with_binary_body() {
 		&client::Config {
 			resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 			resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+			max_ttl: None,
 		},
 		None,
 		BackendConfig::default(),
@@ -2064,6 +2372,7 @@ async fn test_call_tool_with_binary_body() {
 		)),
 		model_catalog: crate::llm::catalog::ModelCatalog::empty(),
 		admin: None,
+		stats: None,
 		upstream: client.clone(),
 		ca: None,
 		spiffe: None,
@@ -2145,5 +2454,60 @@ async fn test_call_tool_with_binary_body() {
 		.await;
 
 	assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
-	assert_eq!(result.unwrap(), expected_response);
+	assert_eq!(
+		result.unwrap().structured_content.unwrap(),
+		expected_response
+	);
+}
+
+#[tokio::test]
+async fn initialize_echoes_supported_legacy_protocol_version() {
+	use futures_util::StreamExt;
+	use rmcp::model::*;
+
+	let (_, handler) = setup().await;
+	let request = JsonRpcRequest {
+		jsonrpc: JsonRpcVersion2_0,
+		id: RequestId::Number(1),
+		request: ClientRequest::InitializeRequest(InitializeRequest::new(
+			InitializeRequestParams::new(
+				ClientCapabilities::default(),
+				Implementation::new("repro", "1.0"),
+			)
+			.with_protocol_version(ProtocolVersion::V_2025_11_25),
+		)),
+	};
+	let mut stream = handler
+		.send_message(request, &IncomingRequestContext::empty())
+		.await
+		.unwrap();
+	let first = stream.next().await.unwrap().unwrap();
+	let value = serde_json::to_value(first).unwrap();
+	assert_eq!(value["result"]["protocolVersion"], json!("2025-11-25"));
+}
+
+#[tokio::test]
+async fn initialize_falls_back_when_client_requests_modern_only_version() {
+	use futures_util::StreamExt;
+	use rmcp::model::*;
+
+	let (_, handler) = setup().await;
+	let request = JsonRpcRequest {
+		jsonrpc: JsonRpcVersion2_0,
+		id: RequestId::Number(2),
+		request: ClientRequest::InitializeRequest(InitializeRequest::new(
+			InitializeRequestParams::new(
+				ClientCapabilities::default(),
+				Implementation::new("repro", "1.0"),
+			)
+			.with_protocol_version(ProtocolVersion::V_2026_07_28),
+		)),
+	};
+	let mut stream = handler
+		.send_message(request, &IncomingRequestContext::empty())
+		.await
+		.unwrap();
+	let first = stream.next().await.unwrap().unwrap();
+	let value = serde_json::to_value(first).unwrap();
+	assert_eq!(value["result"]["protocolVersion"], json!("2025-11-25"));
 }

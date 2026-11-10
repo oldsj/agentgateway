@@ -226,6 +226,7 @@ pub fn test_ed25519_jwks() {
 
 #[test]
 pub fn test_ed25519_jwt_validation() {
+	crate::crypto::jwt::init();
 	// Test fixture from jsonwebtoken 10.3.0 tests/eddsa/private_ed25519_key.pk8.
 	const ED25519_PRIVATE_KEY: &[u8] = &[
 		0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
@@ -284,6 +285,41 @@ pub fn test_ed25519_jwt_validation() {
 		claims.inner.get("sub"),
 		Some(&serde_json::Value::String("test-user".to_string()))
 	);
+}
+
+#[test]
+pub fn test_rsa_1024_signature_rejected() {
+	const TOKEN: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEwMjQifQ.eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIiwic3ViIjoidGVzdC11c2VyIiwiZXhwIjo0MTAyNDQ0ODAwfQ.eV3t3npxnzI_eLLkiIadDiGgsj1CcBokvmWaHzzrj9UTIEbtr4weuX4IkZNZV_tUkI_dJE0ZSBZS2J4LReStjmLhCiJGXxNDiCkRYaKcB_zF6sctmM-KZz70jF6aDSmkH78qG6WFD-Wa25eDZnWHYtMfAkybsi1XOeCIe-RAhzE";
+	let jwks = json!({
+		"keys": [
+			{
+				"use": "sig",
+				"kty": "RSA",
+				"kid": "rsa1024",
+				"alg": "RS256",
+				"e": "AQAB",
+				"n": "wehkfEkAGfXNrM6yzcCdToPi6ocUKxSOidNJtZrqy6heBI_Euf3XtN_6r0zvJMHW-YN8wxS68c8jTF1r3BwZf258uOpzI2YFElSUPrYiImi1lErxh42hrw_bkzyqByyRgvNwZHz5qtGlk4lq-sqEWFJ80xZsk0yLsbNYUrBpNk8"
+			}
+		]
+	});
+	crate::crypto::jwt::init();
+	let provider = Provider::from_jwks(
+		serde_json::from_value(jwks).unwrap(),
+		"https://example.com".to_string(),
+		None,
+		JWTValidationOptions::default(),
+	)
+	.unwrap();
+	let jwt = Jwt {
+		mode: Mode::Strict,
+		providers: vec![provider],
+		location: bearer_location(),
+		preserve_token: false,
+	};
+	assert!(matches!(
+		jwt.validate_claims(TOKEN),
+		Err(TokenError::Invalid(_))
+	));
 }
 
 #[test]
@@ -360,7 +396,7 @@ fn build_signed_token(kid: &str, iss: &str, aud: &str, exp: u64) -> String {
 	build_signed_token_with_payload(kid, json!({ "iss": iss, "aud": aud, "exp": exp }))
 }
 
-fn build_signed_token_with_payload(kid: &str, payload: serde_json::Value) -> String {
+pub(crate) fn build_signed_token_with_payload(kid: &str, payload: serde_json::Value) -> String {
 	// Test key matching the P-256 public coordinates in the JWKS fixtures.
 	const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgltxBTVDLg7C6vE1T
@@ -528,6 +564,63 @@ pub async fn test_apply_strict_missing_token() {
 
 	let res = jwt.apply(Some(&mut req_log), &mut req).await;
 	assert!(matches!(res, Err(super::TokenError::Missing)));
+}
+
+// RFC 6750 §3: a request with no credentials is challenged, but without an error code.
+#[tokio::test]
+pub async fn test_missing_token_response_has_bare_bearer_challenge() {
+	let jwt = super::Jwt {
+		mode: super::Mode::Strict,
+		providers: vec![],
+		location: bearer_location(),
+		preserve_token: false,
+	};
+
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	let mut req_log = make_min_req_log();
+
+	let err = jwt
+		.apply(Some(&mut req_log), &mut req)
+		.await
+		.expect_err("strict mode should reject a request without a token");
+	let resp = crate::proxy::ProxyError::JwtAuthenticationFailure(err).into_response_with_grpc(false);
+
+	assert_eq!(resp.status(), ::http::StatusCode::UNAUTHORIZED);
+	assert_eq!(
+		resp
+			.headers()
+			.get(::http::header::WWW_AUTHENTICATE)
+			.unwrap(),
+		"Bearer"
+	);
+}
+
+// RFC 6750 §3.1: a rejected token is reported as `invalid_token` so clients know to refresh.
+#[test]
+pub fn test_expired_token_response_reports_invalid_token() {
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	let (jwt, kid, issuer, allowed_aud) = setup_test_jwt();
+	let now = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let expired = build_signed_token(kid, issuer, allowed_aud, now - 100_000);
+
+	let err = jwt
+		.validate_claims(&expired)
+		.expect_err("an expired token should be rejected");
+	assert!(matches!(err, TokenError::Invalid(_)));
+	let resp = crate::proxy::ProxyError::JwtAuthenticationFailure(err).into_response_with_grpc(false);
+
+	assert_eq!(resp.status(), ::http::StatusCode::UNAUTHORIZED);
+	assert_eq!(
+		resp
+			.headers()
+			.get(::http::header::WWW_AUTHENTICATE)
+			.unwrap(),
+		r#"Bearer error="invalid_token", error_description="The bearer token has expired""#
+	);
 }
 
 // Permissive mode: allow requests without a token and do not attach claims
@@ -725,7 +818,8 @@ fn make_min_req_log() -> crate::telemetry::log::RequestLog {
 	let log_cfg = log::Config {
 		filter: None,
 		fields: LoggingFields::default(),
-		database_fields: Default::default(),
+		standard_attributes: Default::default(),
+		session: Default::default(),
 		level: "info".to_string(),
 		format: crate::LoggingFormat::Text,
 		database: None,

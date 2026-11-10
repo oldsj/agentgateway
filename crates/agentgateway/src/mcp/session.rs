@@ -35,6 +35,10 @@ use crate::telemetry::log::AsyncLog;
 use crate::types::agent::ResourceName;
 use crate::{mcp, *};
 
+// send_internal is awaited inline, so its size can enlarge every send future that awaits it.
+// A larger future usually means some value is now held across an await.
+const SEND_INTERNAL_FUTURE_SIZE: usize = 6 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Session {
 	encoder: http::sessionpersistence::Encoder,
@@ -69,7 +73,7 @@ impl Session {
 		};
 		let res = self
 			.send_internal(ctx, message)
-			.assert_size::<{ 6 * 1024 }>()
+			.assert_size::<{ SEND_INTERNAL_FUTURE_SIZE }>()
 			.await;
 		Self::handle_error(req_id, res, false).await
 	}
@@ -126,7 +130,15 @@ impl Session {
 						.await;
 					if let Some(sessions) = self.relay.get_sessions() {
 						let s = http::sessionpersistence::SessionState::MCP(
-							http::sessionpersistence::MCPSessionState::new(sessions),
+							http::sessionpersistence::MCPSessionState::new(
+								sessions,
+								self
+									.relay
+									.backend_id
+									.as_ref()
+									.filter(|_| matches!(self.encoder, http::sessionpersistence::Encoder::Aes(_)))
+									.map(ToString::to_string),
+							),
 						);
 						if let Ok(id) = s.encode(&self.encoder) {
 							self.id = id.into();
@@ -168,7 +180,7 @@ impl Session {
 		}
 		let res = self
 			.send_internal(ctx, message)
-			.assert_size::<{ 6 * 1024 }>()
+			.assert_size::<{ SEND_INTERNAL_FUTURE_SIZE }>()
 			.await;
 		match res {
 			// Modern requests are never part of a legacy session, so method-not-found can use its
@@ -181,7 +193,7 @@ impl Session {
 	}
 
 	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
-		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
+		self.relay = Arc::new(self.relay.with_inputs(inputs));
 		self
 	}
 
@@ -278,18 +290,24 @@ impl Session {
 		backend: &str,
 		method: &Strng,
 		params: &mut P,
+		extensions: &mut rmcp::model::Extensions,
 		ctx: &mut IncomingRequestContext,
 		res: rbac::ResourceType,
 		resource_type: &str,
 		resource_name: &str,
 	) -> Result<(), UpstreamError>
 	where
-		P: serde::Serialize + serde::de::DeserializeOwned,
+		P: serde::Serialize
+			+ serde::de::DeserializeOwned
+			+ std::fmt::Debug
+			+ Send
+			+ Sync
+			+ rmcp::model::RequestParamsMeta,
 	{
 		// run guardrails before other policies, as it may add context to CEL
 		self
 			.relay
-			.maybe_run_guardrails_call_request(backend, method, params, ctx)
+			.maybe_run_guardrails_call_request(backend, method, params, extensions, ctx)
 			.await?;
 		let cel = rbac::CelExecWrapper::from(ctx.clone());
 		if self.relay.policies.validate(&res, method, &cel) {
@@ -385,15 +403,17 @@ impl Session {
 		match d {
 			Ok(r) => Ok(r),
 			Err(UpstreamError::Http(ClientError::Status(resp))) => {
-				let resp = http::SendDirectResponse::new(*resp)
-					.await
-					.map_err(ProxyError::Body)?;
-				Err(mcp::Error::UpstreamError(Box::new(resp)).into())
+				Err(mcp::Error::UpstreamError(Box::new(http::SyncResponse::new(*resp))).into())
 			},
 			Err(UpstreamError::Proxy(p)) => Err(p),
-			// Preserve backend-auth error classification through the MCP HTTP transport.
+			// Preserve backend-auth error classification, and responses from backend policies (such
+			// as an ext_authz deny), through the MCP HTTP transport.
 			Err(UpstreamError::Http(ClientError::Proxy(
-				p @ (ProxyError::InvalidRequest | ProxyError::BackendAuthenticationFailed(_)),
+				p @ (ProxyError::InvalidRequest
+				| ProxyError::BackendAuthenticationFailed(_)
+				| ProxyError::JwtAuthenticationFailure(_)
+				| ProxyError::McpAuthenticationFailure(_, _)
+				| ProxyError::DirectResponse { .. }),
 			))) => Err(p),
 			Err(UpstreamError::Authorization {
 				resource_type,
@@ -513,7 +533,15 @@ impl Session {
 						.await;
 						if let Some(sessions) = self.relay.get_sessions() {
 							let s = http::sessionpersistence::SessionState::MCP(
-								http::sessionpersistence::MCPSessionState::new(sessions),
+								http::sessionpersistence::MCPSessionState::new(
+									sessions,
+									self
+										.relay
+										.backend_id
+										.as_ref()
+										.filter(|_| matches!(self.encoder, http::sessionpersistence::Encoder::Aes(_)))
+										.map(ToString::to_string),
+								),
 							);
 							if let Ok(id) = s.encode(&self.encoder) {
 								self.id = id.into();
@@ -621,6 +649,7 @@ impl Session {
 							&service_name,
 							&mcp::guardrails::methods::TOOLS_CALL,
 							&mut ctr.params,
+							&mut ctr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Tool(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -660,6 +689,7 @@ impl Session {
 							&service_name,
 							&mcp::guardrails::methods::PROMPTS_GET,
 							&mut gpr.params,
+							&mut gpr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Prompt(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -682,6 +712,7 @@ impl Session {
 							service_name,
 							&mcp::guardrails::methods::RESOURCES_READ,
 							&mut rrr.params,
+							&mut rrr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Resource(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -877,10 +908,21 @@ impl SessionManager {
 			.get_or_init(|| tokio::spawn(run_idle_reaper(self.sessions.clone())).abort_handle());
 	}
 
-	pub fn get_session(&self, id: &str, builder: RelayInputs) -> Option<Session> {
+	pub fn get_session(
+		&self,
+		id: &str,
+		builder: RelayInputs,
+		ctx: &IncomingRequestContext,
+	) -> Option<Session> {
 		let mut sessions = self.sessions.write().ok()?;
 		let entry = sessions.get_mut(id)?;
-		if entry.backend_id != builder.backend_id {
+		if entry.backend_id != builder.backend_id
+			|| !entry
+				.session
+				.relay
+				.upstreams
+				.conditions_match(&builder.backend, ctx)
+		{
 			return None;
 		}
 		entry.last_access = Instant::now();
@@ -894,7 +936,13 @@ impl SessionManager {
 		ctx: &IncomingRequestContext,
 	) -> Result<Option<Session>, mcp::Error> {
 		if let Some(s) = self.sessions.write().expect("poisoned").get_mut(id) {
-			if s.backend_id != builder.backend_id {
+			if s.backend_id != builder.backend_id
+				|| !s
+					.session
+					.relay
+					.upstreams
+					.conditions_match(&builder.backend, ctx)
+			{
 				return Ok(None);
 			}
 			s.last_access = Instant::now();
@@ -903,10 +951,17 @@ impl SessionManager {
 		let idle_ttl = builder.backend.session_idle_ttl;
 		let backend_id = builder.backend_id.clone();
 		let d = http::sessionpersistence::SessionState::decode(id, &self.encoder)
-			.map_err(|_| mcp::Error::InvalidSessionIdHeader)?;
+			.map_err(|_| mcp::Error::UnknownSession)?;
 		let http::sessionpersistence::SessionState::MCP(state) = d else {
 			return Ok(None);
 		};
+		if state
+			.backend
+			.as_ref()
+			.is_some_and(|b| *b != backend_id.to_string())
+		{
+			return Ok(None);
+		}
 		let relay = builder.build_new_connections(ctx)?;
 		if let Err(err) = relay.set_sessions(state.sessions) {
 			warn!("failed to resume session: {err}");
@@ -1005,21 +1060,21 @@ impl SessionManager {
 		(sess, rx)
 	}
 
+	/// Deletion is best effort: upstream failures are not reported to the client, and a target
+	/// that fails to close keeps its upstream session until that target's own idle timeout.
 	pub async fn delete_session(
 		&self,
-		backend_id: &ResourceName,
 		id: &str,
+		builder: RelayInputs,
 		parts: Parts,
-	) -> Option<Response> {
-		let sess = {
-			let mut sm = self.sessions.write().expect("write lock");
-			if sm.get(id)?.backend_id != *backend_id {
-				return None;
-			}
-			sm.remove(id)?.session
+	) -> Result<Option<Response>, mcp::Error> {
+		let ctx = IncomingRequestContext::new(&parts);
+		// Resume so a replica that never saw the session still closes its upstream sessions.
+		let Some(sess) = self.get_or_resume_session(id, builder, &ctx)? else {
+			return Ok(None);
 		};
-		// Swallow the error
-		sess.delete_session(parts).await.ok()
+		self.sessions.write().expect("write lock").remove(id);
+		Ok(sess.delete_session(parts).await.ok())
 	}
 }
 

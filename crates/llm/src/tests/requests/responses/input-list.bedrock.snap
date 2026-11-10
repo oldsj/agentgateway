@@ -8,7 +8,7 @@ info:
     - type: reasoning
       id: rs_replay
       summary: []
-      encrypted_content: cnNuX2pRenlYWklGSkxscEt5ZmxZa0NmdndJRmVMVjVaYkRXWDRo
+      encrypted_content: "[{\"type\":\"redacted_thinking\",\"data\":\"cnNuX2pRenlYWklGSkxscEt5ZmxZa0NmdndJRmVMVjVaYkRXWDRo\"}]"
     - role: assistant
       content: Hello!
     - role: user
@@ -21,6 +21,12 @@ info:
           text: Let me think through this.
     - role: user
       content: Continue.
+    - type: reasoning
+      id: rs_signed
+      summary: []
+      encrypted_content: "[{\"type\":\"thinking\",\"thinking\":\"Let me check the signature.\",\"signature\":\"SIG-xyz==\"}]"
+    - role: user
+      content: Keep going.
     - type: reasoning
       id: rs_empty
       summary: []
@@ -78,6 +84,27 @@ info:
         "content": [
           {
             "text": "Continue."
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "reasoningContent": {
+              "reasoningText": {
+                "text": "Let me check the signature.",
+                "signature": "SIG-xyz=="
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "text": "Keep going."
           },
           {
             "text": "Please continue."
@@ -112,6 +139,10 @@ info:
       {
         "role": "user",
         "content": "Continue."
+      },
+      {
+        "role": "user",
+        "content": "Keep going."
       },
       {
         "role": "user",

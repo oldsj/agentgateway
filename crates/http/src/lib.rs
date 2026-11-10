@@ -12,6 +12,7 @@ pub type Error = axum_core::Error;
 pub type RawBody = axum_core::body::Body;
 pub type Request = http::Request<Body>;
 pub type Response = http::Response<Body>;
+pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 
 pub trait ResponseBodyExt {
 	/// Replace content and discard the old length.
@@ -107,6 +108,74 @@ pub fn is_length_limit_error(err: &Error) -> bool {
 	err
 		.source()
 		.is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+}
+
+#[derive(Debug, Default)]
+#[must_use]
+pub struct PolicyResponse {
+	pub response_headers: Option<HeaderMap>,
+}
+
+impl PolicyResponse {
+	/// Merges the policy's response headers into `hm`.
+	pub fn apply(self, hm: &mut HeaderMap) {
+		merge_in_headers(self.response_headers, hm);
+	}
+}
+
+/// A Response that can be held in a Sync error. The body is never buffered; it is only
+/// reachable by value, which is what makes the wrapper Sync.
+pub struct SyncResponse {
+	head: http::response::Parts,
+	body: sync_wrapper::SyncWrapper<Body>,
+}
+
+impl std::fmt::Debug for SyncResponse {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SyncResponse")
+			.field("status", &self.head.status)
+			.finish()
+	}
+}
+
+impl SyncResponse {
+	pub fn new(response: Response) -> Self {
+		let (head, body) = response.into_parts();
+		SyncResponse {
+			head,
+			body: sync_wrapper::SyncWrapper::new(body),
+		}
+	}
+
+	pub fn status(&self) -> StatusCode {
+		self.head.status
+	}
+
+	pub fn into_response(self) -> Response {
+		Response::from_parts(self.head, self.body.into_inner())
+	}
+}
+
+pub fn merge_in_headers(additional_headers: Option<HeaderMap>, dest: &mut HeaderMap) {
+	if let Some(rh) = additional_headers {
+		// HeaderMap::into_iter reports the name only for the first value in a repeated field.
+		let mut previous_name = None;
+		for (k, v) in rh.into_iter() {
+			if let Some(k) = k {
+				previous_name = Some(k.clone());
+				// Most response mutations replace an existing header. Set-Cookie is not list-valued,
+				// so each policy and upstream cookie must remain a separate appended field.
+				if k == header::SET_COOKIE {
+					dest.append(k, v);
+				} else {
+					dest.insert(k, v);
+				}
+			// Preserve subsequent Set-Cookie values whose repeated field name was omitted above.
+			} else if previous_name.as_ref() == Some(&header::SET_COOKIE) {
+				dest.append(header::SET_COOKIE, v);
+			}
+		}
+	}
 }
 
 pub mod x_headers {

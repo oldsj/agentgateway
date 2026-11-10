@@ -1,11 +1,17 @@
 name: Mainloop Substrate agentgateway image
 
-# Builds the agentgateway image used by Mainloop's Substrate 0.4.0-alpha1
-# deployment: Substrate's pinned agentgateway (50999825) plus the pod
-# certificate rotation fixes from agentgateway #3686 and #3794.
+# Tests and builds a linux/arm64 agentgateway image for Mainloop's Substrate
+# deployment. Since the 2026-11-10 upstream sync this branch carries no source
+# changes of its own: it is upstream main plus this workflow. Upstream main
+# speaks the Substrate v1 control API (substrate.ateapi.v1), so the image only
+# works with Substrate >= 1.0.0, whose chart already pins upstream v1.7.0.
+# Pull requests run the tests only; the image is published on push.
 
 on:
   push:
+    branches:
+      - mainloop-substrate-certs
+  pull_request:
     branches:
       - mainloop-substrate-certs
   workflow_dispatch:
@@ -19,7 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.98.0"
+  RUST_VERSION: "1.99.0"
   REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/agentgateway
 
 jobs:
@@ -42,6 +48,7 @@ jobs:
 
   image:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     permissions:

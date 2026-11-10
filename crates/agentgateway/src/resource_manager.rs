@@ -135,13 +135,13 @@ impl ResourceFetcher {
 				.map(|r| r.content),
 			ResourceFetcherMode::FilesOnly => match normalized {
 				ResourceRef::File(path) => {
-					FILES_ONLY_READS.with(|reads| {
-						if let Some(reads) = reads.borrow_mut().as_mut() {
-							reads.push(path.clone());
-						}
-					});
-					fs_err::tokio::read(&path)
-						.await
+					// CLI commands like `import` and `migrate` parse config without a runtime.
+					let content = if tokio::runtime::Handle::try_current().is_ok() {
+						fs_err::tokio::read(&path).await
+					} else {
+						fs_err::read(&path)
+					};
+					content
 						.with_context(|| format!("read resource file {}", path.display()))
 						.map(Bytes::from)
 				},
@@ -150,22 +150,6 @@ impl ResourceFetcher {
 				},
 			},
 		}
-	}
-
-	/// Makes the files a recorded parse read ([`record_files_only_reads`]) this
-	/// fetcher's own dependencies. In managed mode each one is fetched through the
-	/// manager, which caches, watches and periodically re-reads it and, once the
-	/// surrounding full computation commits, keeps it active: a change to it
-	/// reloads the config like a change to any other file resource. The other
-	/// modes have nothing to register; the parse already holds the content.
-	pub async fn register_file_dependencies(&self, files: Vec<PathBuf>) -> anyhow::Result<()> {
-		if !matches!(self.mode, ResourceFetcherMode::Managed(_)) {
-			return Ok(());
-		}
-		for path in files.into_iter().collect::<HashSet<_>>() {
-			self.fetch(ResourceRef::File(path)).await?;
-		}
-		Ok(())
 	}
 
 	/// Records managed resource lookups during a full config computation.
@@ -211,28 +195,31 @@ impl ResourceFetcher {
 }
 
 thread_local! {
-	/// The files a files-only fetcher read on this thread while
-	/// [`record_files_only_reads`] was running.
-	static FILES_ONLY_READS: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+	static PARSE_FETCHER: RefCell<Option<ResourceFetcher>> = const { RefCell::new(None) };
 }
 
-/// Runs `parse` and returns, besides its result, every file a
-/// [`ResourceFetcher::files_only`] fetcher read on this thread meanwhile.
-///
-/// Serde hooks (`de_from_local_backend_policy`) resolve backend TLS file
-/// references while the config is deserialized, with a files-only fetcher and
-/// outside any resource manager: the content is current, but the manager never
-/// learns of the file, so it gets no watch, no periodic re-read and no place in
-/// the active set, and a certificate referenced only there is re-read only when
-/// some other resource happens to trigger a reload. The parse is synchronous,
-/// so recording on the thread that runs it is exact; the caller registers the
-/// files with its managed fetcher afterwards
-/// ([`ResourceFetcher::register_file_dependencies`]).
-pub fn record_files_only_reads<T>(parse: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
-	let previous = FILES_ONLY_READS.with(|reads| reads.replace(Some(Vec::new())));
-	let value = parse();
-	let reads = FILES_ONLY_READS.with(|reads| reads.replace(previous));
-	(value, reads.unwrap_or_default())
+/// Runs a synchronous config parse with `fetcher` available to serde hooks
+/// through [`parse_fetcher`].
+pub fn with_parse_fetcher<T>(fetcher: &ResourceFetcher, parse: impl FnOnce() -> T) -> T {
+	struct Clear;
+	impl Drop for Clear {
+		fn drop(&mut self) {
+			PARSE_FETCHER.with(|f| f.take());
+		}
+	}
+	PARSE_FETCHER.with(|f| f.replace(Some(fetcher.clone())));
+	let _clear = Clear;
+	parse()
+}
+
+/// The fetcher of the enclosing [`with_parse_fetcher`], or a files-only fetcher
+/// outside one.
+pub fn parse_fetcher() -> ResourceFetcher {
+	PARSE_FETCHER.with(|f| {
+		f.borrow()
+			.clone()
+			.unwrap_or_else(ResourceFetcher::files_only)
+	})
 }
 
 impl ResourceFetchScope<'_> {
@@ -401,11 +388,6 @@ impl ResourceManager {
 		self.inner.change_tx.subscribe()
 	}
 
-	pub async fn fetch_and_wait(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
-		let resource = normalize_resource(resource)?;
-		self.fetch_and_wait_normalized(resource).await
-	}
-
 	async fn fetch_and_wait_normalized(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
 		if let ResourceRef::File(path) = &resource {
 			self.watch_file(path)?;
@@ -416,11 +398,6 @@ impl ResourceManager {
 		let FetchResult { content, next } = self.fetch(&resource).await?;
 		self.store(resource, content.clone(), next);
 		Ok(content)
-	}
-
-	pub async fn fetch_cached_or_direct(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
-		let resource = normalize_resource(resource)?;
-		self.fetch_cached_or_direct_normalized(resource).await
 	}
 
 	async fn fetch_cached_or_direct_normalized(
@@ -436,12 +413,24 @@ impl ResourceManager {
 	}
 
 	pub fn retain_resources(&self, retained: HashSet<ResourceRef>) {
-		*self
-			.inner
-			.active_resources
-			.lock()
-			.expect("resource active set mutex poisoned") = retained.clone();
+		let previous = std::mem::replace(
+			&mut *self
+				.inner
+				.active_resources
+				.lock()
+				.expect("resource active set mutex poisoned"),
+			retained.clone(),
+		);
 		self.retain_cached_and_watched_resources(&retained);
+		// refresh_file ignores watch events for files that are not active yet, so a
+		// change between a new file's first read and this commit would be lost.
+		for resource in retained.difference(&previous) {
+			if let ResourceRef::File(path) = resource {
+				let manager = self.clone();
+				let path = path.clone();
+				tokio::spawn(async move { manager.refresh_file(path).await });
+			}
+		}
 	}
 
 	fn retain_active_resources(&self) {
@@ -590,7 +579,7 @@ impl ResourceManager {
 		fetch_direct(&self.inner.client, resource).await
 	}
 
-	pub(crate) fn is_active(&self, resource: &ResourceRef) -> bool {
+	fn is_active(&self, resource: &ResourceRef) -> bool {
 		self
 			.inner
 			.active_resources
@@ -847,6 +836,7 @@ mod tests {
 			&crate::client::Config {
 				resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 				resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			crate::BackendConfig::default(),
@@ -1029,12 +1019,18 @@ mod tests {
 
 	#[tokio::test]
 	async fn failed_http_refresh_reschedules_a_retry_that_will_actually_fire() {
-		// A closed local port fails at connect time (like a real transient
-		// network blip), rather than a non-2xx status -- `fetch_direct` only
-		// treats transport-level failures as errors, not HTTP error statuses.
-		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		// A server that drops every connection fails at the transport level
+		// (like a real transient network blip), rather than a non-2xx status --
+		// `fetch_direct` only treats transport-level failures as errors, not HTTP
+		// error statuses. Keeping the listener bound prevents another test from
+		// reusing the port.
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.local_addr().unwrap();
-		drop(listener);
+		tokio::spawn(async move {
+			while let Ok((conn, _)) = listener.accept().await {
+				drop(conn);
+			}
+		});
 
 		let manager = ResourceManager::new(test_client()).unwrap();
 		let url: http::Uri = format!("http://{addr}/resource").parse().unwrap();
@@ -1081,58 +1077,78 @@ mod tests {
 		);
 	}
 
-	/// A serde hook reads backend TLS files with a files-only fetcher while the
-	/// config is parsed. Recorded around the parse and registered with the managed
-	/// fetcher, such a file becomes a dependency like any other: cached, watched,
-	/// active once the computation commits.
 	#[tokio::test]
-	async fn files_only_reads_during_a_recorded_parse_become_managed_dependencies() {
+	async fn parse_fetcher_reads_through_the_enclosing_managed_fetcher() {
 		let dir = tempfile::tempdir().unwrap();
-		let file = dir.path().join("credential-bundle.pem");
+		let file = dir.path().join("root.pem");
 		fs_err::write(&file, "cert").unwrap();
 		let resource = normalize_resource(ResourceRef::File(file.clone())).unwrap();
 		let ResourceRef::File(abspath) = resource.clone() else {
 			unreachable!()
 		};
-
-		let ((), reads) = record_files_only_reads(|| {
-			// What `de_from_local_backend_policy` does: a files-only fetcher, blocked on.
-			let content = futures::executor::block_on(
-				ResourceFetcher::files_only().fetch(ResourceRef::File(file.clone())),
-			)
-			.unwrap();
-			assert_eq!(content, Bytes::from("cert"));
-		});
-		assert_eq!(reads, vec![abspath.clone()]);
-		// Outside a recording a files-only read leaves no trace.
-		ResourceFetcher::files_only()
-			.fetch(ResourceRef::File(file.clone()))
-			.await
-			.unwrap();
-		FILES_ONLY_READS.with(|r| assert!(r.borrow().is_none()));
-
-		// Nothing to register for a fetcher without a manager, even for a file that
-		// is gone: the parse already holds the content.
-		ResourceFetcher::direct(test_client())
-			.register_file_dependencies(vec![dir.path().join("missing.pem")])
-			.await
-			.unwrap();
-
 		let manager = ResourceManager::new(test_client()).unwrap();
 		let resources = ResourceFetcher::managed(manager.clone());
+
 		scoped(&resources, || async {
-			resources.register_file_dependencies(reads.clone()).await
+			let content = with_parse_fetcher(&resources, || {
+				futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file.clone())))
+			})?;
+			assert_eq!(content, Bytes::from("cert"));
+			Ok(())
 		})
 		.await
 		.unwrap();
+
 		assert_eq!(manager.cached(&resource), Some(Bytes::from("cert")));
-		assert!(
-			manager.is_active(&resource),
-			"the registered file is active"
-		);
-		assert!(
-			manager.inner.watched_files.contains(&abspath),
-			"the registered file is watched"
-		);
+		assert!(manager.is_active(&resource));
+		assert!(manager.inner.watched_files.contains(&abspath));
+		PARSE_FETCHER.with(|f| assert!(f.borrow().is_none()));
+	}
+
+	#[test]
+	fn parse_fetcher_reads_files_without_a_runtime() {
+		// `agentgateway migrate` parsing a config with a file-backed secret.
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("secret");
+		fs_err::write(&file, "s3cret").unwrap();
+
+		let content =
+			futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file))).unwrap();
+		assert_eq!(content, Bytes::from("s3cret"));
+	}
+
+	#[tokio::test]
+	async fn a_change_after_the_parse_read_is_published() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("root.pem");
+		fs_err::write(&file, "old").unwrap();
+		let resource = normalize_resource(ResourceRef::File(file.clone())).unwrap();
+		let manager = ResourceManager::new(test_client()).unwrap();
+		let resources = ResourceFetcher::managed(manager.clone());
+		let mut changes = manager.subscribe_changes();
+
+		scoped(&resources, || async {
+			let content = with_parse_fetcher(&resources, || {
+				futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file.clone())))
+			})?;
+			assert_eq!(content, Bytes::from("old"));
+			// The rest of the computation runs after the parse read.
+			fs_err::write(&file, "new").unwrap();
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			Ok(())
+		})
+		.await
+		.unwrap();
+
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				if manager.cached(&resource) == Some(Bytes::from("new")) {
+					return;
+				}
+				changes.changed().await.unwrap();
+			}
+		})
+		.await
+		.expect("a change made after the parse read reaches the cache and is published");
 	}
 }

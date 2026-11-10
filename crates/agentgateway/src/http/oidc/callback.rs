@@ -45,7 +45,7 @@ impl CallbackTransactionState {
 pub(super) fn start_login(
 	policy: &OidcPolicy,
 	req: &Request,
-) -> Result<crate::http::PolicyResponse, Error> {
+) -> Result<super::OidcResponse, Error> {
 	let transaction_id = generate_transaction_id();
 	let csrf_state = generate_state();
 	let nonce = generate_nonce();
@@ -102,14 +102,14 @@ pub(super) fn start_login(
 		],
 	);
 	let response = build_redirect_response(&location, &[cookie])?;
-	Ok(crate::http::PolicyResponse::default().with_response(response))
+	Ok(super::OidcResponse::default().with_response(response))
 }
 
 pub(super) async fn handle_callback(
 	policy: &OidcPolicy,
 	context: CallbackRequestContext,
 	client: PolicyClient,
-) -> Result<crate::http::PolicyResponse, Error> {
+) -> Result<super::OidcResponse, Error> {
 	let transaction = policy
 		.session
 		.decode_transaction(&context.transaction_cookie)?;
@@ -154,11 +154,14 @@ pub(super) async fn handle_callback(
 		return Err(Error::NonceMismatch);
 	}
 
-	// TODO: Revisit whether browser sessions should persist access_token / refresh_token.
-	// The current stateless cookie only stores the validated id_token because that is what
-	// the runtime uses today, and larger token payloads can exceed browser cookie limits.
+	let subject = claims
+		.inner
+		.get("sub")
+		.and_then(Value::as_str)
+		.map(str::to_owned);
 	let session = BrowserSession {
 		policy_id: policy.policy_id.clone(),
+		subject: subject.clone(),
 		raw_id_token: SecretString::new(id_token.into_boxed_str()),
 		expires_at_unix: Some(cap_session_expiry(
 			now_unix(),
@@ -173,12 +176,17 @@ pub(super) async fn handle_callback(
 		policy.redirect_uri.https,
 		policy.session.ttl,
 	);
+	let refresh_cookie =
+		policy.refresh_cookie(token.refresh_token.map(SecretString::from), subject)?;
 	let clear_transaction = policy
 		.session
 		.clear_cookie(&context.transaction_cookie_name, policy.redirect_uri.https);
 	let location = transaction.original_uri;
-	let response = build_redirect_response(&location, &[session_cookie, clear_transaction])?;
-	Ok(crate::http::PolicyResponse::default().with_response(response))
+	let response = build_redirect_response(
+		&location,
+		&[session_cookie, refresh_cookie, clear_transaction],
+	)?;
+	Ok(super::OidcResponse::default().with_response(response))
 }
 
 fn with_query(uri: &super::ProviderEndpoint, params: &[(&str, String)]) -> String {
